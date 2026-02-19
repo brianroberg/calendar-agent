@@ -20,6 +20,7 @@ load_dotenv()
 
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8080/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen/qwen3-14b")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
 # Regex to strip Qwen3 thinking tags
 THINKING_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -142,9 +143,10 @@ class LocalMLXProvider(LLMProvider):
     Default configuration targets a local Qwen3-14B model.
     """
 
-    def __init__(self, url: str | None = None, model: str | None = None):
+    def __init__(self, url: str | None = None, model: str | None = None, api_key: str | None = None):
         self.url = url or LLM_URL
         self.model = model or LLM_MODEL
+        self.api_key = api_key if api_key is not None else LLM_API_KEY
 
     async def generate(
         self,
@@ -155,9 +157,13 @@ class LocalMLXProvider(LLMProvider):
     ) -> str:
         """Generate a response using the local MLX server."""
         try:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
             async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(
                     self.url,
+                    headers=headers,
                     json={
                         "model": self.model,
                         "messages": [
