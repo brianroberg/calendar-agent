@@ -1,12 +1,15 @@
 """Tests for Calendar Agent server endpoints."""
 
 
+import re
+import typing
+from collections.abc import Mapping
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from calendar_agent.calendar_server import EventSummary, app, event_to_summary
+from calendar_agent.calendar_server import EventSummary, SearchFilters, app, event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
@@ -34,6 +37,64 @@ from tests.factories import (
     colleague_copy,
     get_sample_event,
 )
+
+# ============================================================================
+# Minimal valid request bodies, one per request-body route. Shared by the
+# per-route endpoint tests and the unknown-field tables below so there is one
+# copy of "what a valid body looks like".
+# ============================================================================
+
+CREATE_EVENT_BODY = {
+    "summary": "New Meeting",
+    "start": {"dateTime": "2024-01-15T10:00:00Z"},
+    "end": {"dateTime": "2024-01-15T11:00:00Z"},
+}
+UPDATE_EVENT_BODY = {
+    "summary": "Updated Meeting",
+    "start": {"dateTime": "2024-01-15T14:00:00Z"},
+    "end": {"dateTime": "2024-01-15T15:00:00Z"},
+}
+PATCH_EVENT_BODY = {"summary": "Renamed Meeting"}
+RESPOND_BODY = {"response_status": "accepted"}
+SUMMARIZE_BODY = {"calendar_id": "primary", "event_id": "event_123", "format": "brief"}
+ASK_ABOUT_BODY = {
+    "calendar_id": "primary",
+    "event_id": "event_123",
+    "question": "What time is the meeting?",
+}
+BATCH_SUMMARIZE_BODY = {
+    "calendar_id": "primary",
+    "event_ids": ["event_1", "event_2", "event_3"],
+    "triage": False,
+}
+FIND_FREE_TIME_BODY = {
+    "calendar_id": "primary",
+    "time_min": "2024-01-15T09:00:00Z",
+    "time_max": "2024-01-15T17:00:00Z",
+    "duration_minutes": 30,
+}
+ANALYZE_SCHEDULE_BODY = {
+    "calendar_id": "primary",
+    "time_min": "2024-01-15T00:00:00Z",
+    "time_max": "2024-01-22T00:00:00Z",
+    "analysis_type": "overview",
+}
+PREPARE_BRIEFING_BODY = {"calendar_id": "primary", "briefing_type": "daily"}
+SEARCH_BODY = {
+    "calendar_id": "primary",
+    "filters": {
+        "query": "meeting",
+        "time_min": "2024-01-01T00:00:00Z",
+        "time_max": "2024-01-31T23:59:59Z",
+    },
+}
+BULK_DELETE_BODY = {
+    "operations": [
+        {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
+        {"operation": "delete", "event_id": "event_2", "calendar_id": "primary"},
+    ]
+}
+
 
 # ============================================================================
 # Health Endpoint Tests
@@ -430,12 +491,7 @@ class TestEventCreateEndpoint:
 
     def test_create_event_success(self, client, mock_proxy_client):
         """Create event returns created event."""
-        event_data = {
-            "summary": "New Meeting",
-            "start": {"dateTime": "2024-01-15T10:00:00Z"},
-            "end": {"dateTime": "2024-01-15T11:00:00Z"},
-        }
-        response = client.post("/calendars/primary/events", json=event_data)
+        response = client.post("/calendars/primary/events", json=CREATE_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -519,12 +575,7 @@ class TestEventUpdateEndpoint:
 
     def test_update_event_success(self, client, mock_proxy_client):
         """Update event returns updated event."""
-        event_data = {
-            "summary": "Updated Meeting",
-            "start": {"dateTime": "2024-01-15T14:00:00Z"},
-            "end": {"dateTime": "2024-01-15T15:00:00Z"},
-        }
-        response = client.put("/calendars/primary/events/event_123", json=event_data)
+        response = client.put("/calendars/primary/events/event_123", json=UPDATE_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -535,8 +586,7 @@ class TestEventPatchEndpoint:
 
     def test_patch_event_success(self, client, mock_proxy_client):
         """Patch event with partial update."""
-        patch_data = {"summary": "Renamed Meeting"}
-        response = client.patch("/calendars/primary/events/event_123", json=patch_data)
+        response = client.patch("/calendars/primary/events/event_123", json=PATCH_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -652,10 +702,7 @@ class TestEventRespondEndpoint:
     def test_respond_success(self, client, mock_proxy_client):
         """RSVP forwards to the proxy client and returns the updated event."""
         mock_proxy_client.respond_to_event.return_value = {"id": "e1", "summary": "GMDM"}
-        resp = client.post(
-            "/calendars/primary/events/e1/respond",
-            json={"response_status": "accepted"},
-        )
+        resp = client.post("/calendars/primary/events/e1/respond", json=RESPOND_BODY)
         assert resp.status_code == 200
         data = resp.json()
         assert data["success"] is True
@@ -1149,12 +1196,7 @@ class TestSummarizeEndpoint:
 
     def test_summarize_success(self, client, mock_proxy_client, mock_llm_service):
         """Summarize event returns AI summary."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_id": "event_123",
-            "format": "brief",
-        }
-        response = client.post("/summarize", json=request_data)
+        response = client.post("/summarize", json=SUMMARIZE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1189,12 +1231,7 @@ class TestAskAboutEndpoint:
 
     def test_ask_about_success(self, client, mock_proxy_client, mock_llm_service):
         """Ask about event returns AI answer."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_id": "event_123",
-            "question": "What time is the meeting?",
-        }
-        response = client.post("/ask-about", json=request_data)
+        response = client.post("/ask-about", json=ASK_ABOUT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1215,12 +1252,7 @@ class TestBatchSummarizeEndpoint:
 
     def test_batch_summarize_success(self, client, mock_proxy_client, mock_llm_service):
         """Batch summarize returns summaries for multiple events."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_ids": ["event_1", "event_2", "event_3"],
-            "triage": False,
-        }
-        response = client.post("/batch-summarize", json=request_data)
+        response = client.post("/batch-summarize", json=BATCH_SUMMARIZE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1264,13 +1296,7 @@ class TestFindFreeTimeEndpoint:
 
     def test_find_free_time_success(self, client, mock_proxy_client, mock_llm_service):
         """Find free time returns available slots and suggestions."""
-        request_data = {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T09:00:00Z",
-            "time_max": "2024-01-15T17:00:00Z",
-            "duration_minutes": 30,
-        }
-        response = client.post("/find-free-time", json=request_data)
+        response = client.post("/find-free-time", json=FIND_FREE_TIME_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1309,13 +1335,7 @@ class TestAnalyzeScheduleEndpoint:
 
     def test_analyze_schedule_success(self, client, mock_proxy_client, mock_llm_service):
         """Analyze schedule returns insights and metrics."""
-        request_data = {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T00:00:00Z",
-            "time_max": "2024-01-22T00:00:00Z",
-            "analysis_type": "overview",
-        }
-        response = client.post("/analyze-schedule", json=request_data)
+        response = client.post("/analyze-schedule", json=ANALYZE_SCHEDULE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1341,11 +1361,7 @@ class TestPrepareBriefingEndpoint:
 
     def test_prepare_briefing_daily(self, client, mock_proxy_client, mock_llm_service):
         """Prepare daily briefing returns schedule overview."""
-        request_data = {
-            "calendar_id": "primary",
-            "briefing_type": "daily",
-        }
-        response = client.post("/prepare-briefing", json=request_data)
+        response = client.post("/prepare-briefing", json=PREPARE_BRIEFING_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1384,15 +1400,7 @@ class TestSearchEndpoint:
 
     def test_search_success(self, client, mock_proxy_client):
         """Search events with filters."""
-        request_data = {
-            "calendar_id": "primary",
-            "filters": {
-                "query": "meeting",
-                "time_min": "2024-01-01T00:00:00Z",
-                "time_max": "2024-01-31T23:59:59Z",
-            },
-        }
-        response = client.post("/search", json=request_data)
+        response = client.post("/search", json=SEARCH_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1453,13 +1461,7 @@ class TestBulkActionsEndpoint:
     def test_bulk_delete_success(self, client, mock_proxy_client):
         """Bulk delete events."""
         mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
-        request_data = {
-            "operations": [
-                {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
-                {"operation": "delete", "event_id": "event_2", "calendar_id": "primary"},
-            ]
-        }
-        response = client.post("/bulk-actions", json=request_data)
+        response = client.post("/bulk-actions", json=BULK_DELETE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1909,3 +1911,1141 @@ class TestBulkStatusCode:
         from calendar_agent.calendar_server import bulk_status_code
 
         assert bulk_status_code(codes) == expected
+# ============================================================================
+# Unknown-Field Rejection Tests (issue #8)
+#
+# Every request model used to inherit Pydantic's default extra="ignore": an
+# unrecognized key was silently dropped instead of rejected. That produced
+# HTTP 200 / success:true responses that were confidently wrong -- e.g. a
+# caller sending Google's own "timeMin"/"timeMax" got an unbounded search
+# with no error at all. These tests pin extra="forbid" on every request
+# model: an unknown or misspelled field must be a 422, not a silent no-op.
+# ============================================================================
+
+
+def assert_rejected_for_unknown_key(response, bogus_key, mock_proxy_client):
+    """The response is a 422 whose ONLY error is extra_forbidden on `bogus_key`.
+
+    Asserting the cause (not just the status) proves the base payload itself
+    was valid and the rejection is the unknown key, nothing else -- and that
+    nothing reached the proxy.
+    """
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert [(err["type"], err["loc"][-1]) for err in detail] == [
+        ("extra_forbidden", bogus_key)
+    ], detail
+    assert mock_proxy_client.method_calls == [], "a rejected request reached the proxy"
+
+
+# One row per request-body route: (method, path, minimal valid body).
+route_cases = pytest.mark.parametrize(
+    "method,path,base_payload",
+    [
+        pytest.param(method, path, payload, id=f"{method.upper()} {path}")
+        for method, path, payload in [
+            ("post", "/calendars/primary/events", CREATE_EVENT_BODY),
+            ("put", "/calendars/primary/events/event_123", UPDATE_EVENT_BODY),
+            ("patch", "/calendars/primary/events/event_123", PATCH_EVENT_BODY),
+            ("post", "/calendars/primary/events/event_123/respond", RESPOND_BODY),
+            ("post", "/summarize", SUMMARIZE_BODY),
+            ("post", "/ask-about", ASK_ABOUT_BODY),
+            ("post", "/batch-summarize", BATCH_SUMMARIZE_BODY),
+            ("post", "/find-free-time", FIND_FREE_TIME_BODY),
+            ("post", "/analyze-schedule", ANALYZE_SCHEDULE_BODY),
+            ("post", "/prepare-briefing", PREPARE_BRIEFING_BODY),
+            ("post", "/search", SEARCH_BODY),
+            ("post", "/bulk-actions", BULK_DELETE_BODY),
+        ]
+    ],
+)
+
+
+# Unknown keys below the top level, plus the issue's own three examples:
+# (method, path, payload containing the bogus key, the bogus key).
+nested_cases = pytest.mark.parametrize(
+    "method,path,payload,bogus_key",
+    [
+        pytest.param(
+            "post", "/search",
+            {"calendar_id": "primary", "timeMin": "2026-01-01T00:00:00Z"},
+            "timeMin", id="issue example: timeMin on /search",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"title": "Standup"},
+            "title", id="issue example: title on create",
+        ),
+        pytest.param(
+            "post", "/find-free-time",
+            {**FIND_FREE_TIME_BODY, "preferMorning": True},
+            "preferMorning", id="issue example: preferMorning on /find-free-time",
+        ),
+        pytest.param(
+            "post", "/search",
+            {"calendar_id": "primary", "filters": {"query": "meeting", "bogus": "x"}},
+            "bogus", id="inside filters",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{**BULK_DELETE_BODY["operations"][0], "bogus": "x"}]},
+            "bogus", id="inside a bulk operation",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{"operation": "update", "event_id": "e1", "calendar_id": "primary",
+                             "updates": {"summary": "s", "bogus": "x"}}]},
+            "bogus", id="inside bulk update `updates`",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{"operation": "patch", "event_id": "e1", "calendar_id": "primary",
+                             "updates": {"summary": "s", "bogus": "x"}}]},
+            "bogus", id="inside bulk patch `updates`",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "start": {"dateTime": "2024-01-15T09:00:00Z", "bogus": "x"}},
+            "bogus", id="inside start",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "attendees": [{"email": "alice@example.com", "bogus": "x"}]},
+            "bogus", id="inside an attendee",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "reminders": {"useDefault": False, "bogus": "x"}},
+            "bogus", id="inside reminders",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "reminders": {"useDefault": False,
+                                           "overrides": [{"method": "popup", "minutes": 5, "bogus": "x"}]}},
+            "bogus", id="inside a reminder override",
+        ),
+    ],
+)
+
+
+class TestUnknownFieldsRejected:
+    """An unrecognized field on any request body is a 422, not a silent drop."""
+
+    @route_cases
+    def test_unknown_top_level_field_rejected(
+        self, client, mock_proxy_client, method, path, base_payload
+    ):
+        payload = {**base_payload, "bogus_field_xyz": "should not be accepted"}
+        response = getattr(client, method)(path, json=payload)
+        assert_rejected_for_unknown_key(response, "bogus_field_xyz", mock_proxy_client)
+
+    @nested_cases
+    def test_unknown_nested_field_rejected(
+        self, client, mock_proxy_client, method, path, payload, bogus_key
+    ):
+        response = getattr(client, method)(path, json=payload)
+        assert_rejected_for_unknown_key(response, bogus_key, mock_proxy_client)
+
+
+# ---------------------------------------------------------------------------
+# Structural guard: the tables above are hand-maintained. This walks the
+# app's own routes so the next request model -- or a field typed as a plain
+# dict / Mapping / Any / object, through which unknown keys would pass
+# unvalidated -- cannot silently revert to extra="ignore" without a test
+# failing. Body models declared on `Depends(...)` functions are walked too;
+# `TestRouteWalkGuards` pins each of these against a throwaway model.
+# ---------------------------------------------------------------------------
+
+
+# Annotations through which an unknown key would pass unvalidated. The walker
+# reports each as the normalised type here (any mapping -> dict).
+OPEN_TYPES = frozenset({dict, typing.Any, object})
+
+
+def _iter_model_types(annotation):
+    """Yield every BaseModel subclass reachable from a type annotation,
+    unwrapping Optional/list/Union/Annotated, and yield an OPEN_TYPES member
+    for any annotation that would accept unknown keys unvalidated: a mapping
+    (bare or parametrised, reported as `dict`), `typing.Any`, or `object`."""
+    from pydantic import BaseModel
+
+    if annotation is typing.Any or annotation is object:
+        yield annotation
+        return
+    if isinstance(annotation, type):
+        if issubclass(annotation, BaseModel):
+            yield annotation
+            return
+        if issubclass(annotation, Mapping):
+            yield dict
+            return
+    origin = typing.get_origin(annotation)
+    if isinstance(origin, type) and issubclass(origin, Mapping):
+        yield dict
+        return
+    for arg in typing.get_args(annotation):
+        yield from _iter_model_types(arg)
+
+
+def _iter_body_params(dependant):
+    """Body params of a route, including those of its `Depends` sub-dependencies
+    at any depth -- the same set FastAPI resolves for the request body."""
+    yield from dependant.body_params
+    for sub in dependant.dependencies:
+        yield from _iter_body_params(sub)
+
+
+def iter_request_models(app=None):
+    """Every request-body model the app accepts, including nested ones and
+    those declared on `Depends(...)` functions.
+
+    Returns {model: "<where it was reached from>"}; an OPEN_TYPES member
+    appears as a key if any reachable field is typed that loosely. `app`
+    defaults to the real server; the guard's own tests pass a throwaway one.
+    """
+    from pydantic import BaseModel
+
+    if app is None:
+        from calendar_agent.calendar_server import app
+
+    found: dict[object, str] = {}
+    pending = []
+    for route in app.routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        for param in _iter_body_params(dependant):
+            for model in _iter_model_types(param.type_):
+                pending.append((model, f"{sorted(route.methods)[0]} {route.path} body"))
+    while pending:
+        model, origin = pending.pop()
+        if model in found:
+            continue
+        found[model] = origin
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            continue  # an open type: nothing beneath it to walk
+        for name, field in model.model_fields.items():
+            for nested in _iter_model_types(field.annotation):
+                pending.append((nested, f"{model.__name__}.{name}"))
+    return found
+
+
+class TestRequestModelsAreStrict:
+    """Every request model, at every depth, forbids unknown fields (T1)."""
+
+    def test_walk_finds_the_models(self):
+        from calendar_agent.calendar_server import (
+            EventAttendee,
+            EventPatchRequest,
+            EventReminder,
+            EventUpdateRequest,
+            SearchFilters,
+        )
+
+        found = iter_request_models()
+        # Sanity: the walk reaches top-level, nested and union-member models.
+        for model in (EventUpdateRequest, EventPatchRequest, EventAttendee,
+                      EventReminder, SearchFilters):
+            assert model in found, f"{model.__name__} not reached by the route walk"
+        assert len(found) >= 15
+
+    def test_every_request_model_forbids_extra(self, subtests):
+        for model, origin in iter_request_models().items():
+            if model in OPEN_TYPES:
+                continue
+            with subtests.test(model=model.__name__, reached_from=origin):
+                assert model.model_config.get("extra") == "forbid", (
+                    f"{model.__name__} (reached from {origin}) does not forbid "
+                    "unknown fields -- an unrecognized key would be silently dropped"
+                )
+
+    def test_no_request_field_is_open(self):
+        """No reachable field is typed so loosely that unknown keys inside it
+        would be forwarded verbatim (see #8, bulk `updates`)."""
+        found = iter_request_models()
+        open_fields = {found[t] for t in OPEN_TYPES if t in found}
+        assert not open_fields, (
+            f"request field(s) reached from {sorted(open_fields)} are typed as a "
+            "plain dict / Mapping / Any / object"
+        )
+
+
+class TestRouteWalkGuards:
+    """The structural guard is itself guarded (fix round, item 5): a walker
+    that cannot see a loosely typed field, or a model reached only through a
+    `Depends(...)` sub-dependency, is a guard that passes vacuously. Each
+    case below is a throwaway model the pre-fix walker missed."""
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            pytest.param(dict, id="bare-dict"),
+            pytest.param(Mapping, id="bare-Mapping"),
+            pytest.param(typing.Any, id="Any"),
+            pytest.param(object, id="object"),
+            pytest.param(dict[str, typing.Any], id="dict[str, Any]"),
+            pytest.param(dict | None, id="dict | None"),
+            pytest.param(list[typing.Any], id="list[Any]"),
+            pytest.param(typing.Mapping[str, int], id="typing.Mapping[str, int]"),
+        ],
+    )
+    def test_open_annotation_is_flagged(self, annotation):
+        assert set(_iter_model_types(annotation)) & OPEN_TYPES, (
+            f"{annotation!r} lets unknown keys through but the walker does not flag it"
+        )
+
+    @pytest.mark.parametrize(
+        "annotation", [str, int, str | None, list[str], typing.Literal["a"]]
+    )
+    def test_closed_annotation_is_not_flagged(self, annotation):
+        assert not set(_iter_model_types(annotation)) & OPEN_TYPES
+
+    def test_walk_flags_open_fields_on_a_body_model(self):
+        from fastapi import FastAPI
+        from pydantic import BaseModel, ConfigDict
+
+        class Blob(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            payload: typing.Any
+            tags: object
+            meta: Mapping
+
+        mini = FastAPI()
+
+        @mini.post("/blob")
+        def route(body: Blob):  # pragma: no cover - never called
+            return body
+
+        found = iter_request_models(mini)
+        assert Blob in found
+        assert {t for t in OPEN_TYPES if t in found} == OPEN_TYPES
+        assert found[typing.Any] == "Blob.payload"
+        assert found[object] == "Blob.tags"
+        assert found[dict] == "Blob.meta"
+
+    def test_walk_reaches_models_behind_depends(self):
+        """A body model declared on a `Depends` function -- one or two levels
+        down -- is request surface just like a route parameter."""
+        from fastapi import Depends, FastAPI
+        from pydantic import BaseModel, ConfigDict
+
+        class ViaDepends(BaseModel):  # deliberately NOT extra="forbid"
+            x: int
+
+        class ViaNestedDepends(BaseModel):
+            y: int
+
+        class Direct(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            z: int
+
+        def inner(body: ViaNestedDepends):  # pragma: no cover
+            return body
+
+        def outer(
+            body: ViaDepends, nested: typing.Annotated[object, Depends(inner)]
+        ):  # pragma: no cover
+            return body
+
+        mini = FastAPI()
+
+        @mini.post("/deep")
+        def route(
+            direct: Direct, dep: typing.Annotated[object, Depends(outer)]
+        ):  # pragma: no cover
+            return direct
+
+        found = iter_request_models(mini)
+        assert Direct in found
+        assert ViaDepends in found, "model behind one Depends not reached"
+        assert ViaNestedDepends in found, "model behind two Depends not reached"
+
+    def test_walk_matches_fastapi_flat_dependant_on_the_real_app(self):
+        """Cross-check: per route, the top-level body models the walk starts
+        from equal what FastAPI itself resolves for the request body."""
+        from fastapi.dependencies.utils import get_flat_dependant
+
+        from calendar_agent.calendar_server import app
+
+        for route in app.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            via_fastapi = {
+                m for p in get_flat_dependant(dependant).body_params
+                for m in _iter_model_types(p.type_)
+            }
+            via_walk = {m for p in _iter_body_params(dependant) for m in _iter_model_types(p.type_)}
+            assert via_walk == via_fastapi, route.path
+
+
+# ============================================================================
+# Validation-Error Envelope Tests (issue #8, second review round)
+#
+# With extra="forbid", a 422 is now the main way a misnamed field fails. The
+# briefing skills pipe responses through
+#   jq 'if .success then .briefing else "Error: " + .error end'
+# so a 422 that carries only FastAPI's default {"detail": [...]} renders as a
+# blank "Error: ". Every 422 must carry the same success/error envelope as
+# every other failure; `detail` is kept for clients that read it.
+# ============================================================================
+
+
+class TestValidationErrorEnvelope:
+    """A 422 carries {"success": false, "error": "..."} plus FastAPI's `detail`."""
+
+    def test_unknown_field_422_carries_envelope(self, client):
+        response = client.post("/calendars/primary/events", json={"title": "Standup"})
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "title" in data["error"]
+        assert "Extra inputs are not permitted" in data["error"]
+        assert data["detail"][0]["type"] == "extra_forbidden"
+        assert data["detail"][0]["loc"] == ["body", "title"]
+
+    def test_missing_field_422_carries_envelope(self, client):
+        response = client.post(
+            "/ask-about", json={"calendar_id": "primary", "event_id": "event_123"}
+        )
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "question" in data["error"]
+        assert "Field required" in data["error"]
+
+    def test_multiple_errors_are_all_named(self, client):
+        response = client.post(
+            "/find-free-time",
+            json={
+                "calendar_id": "primary",
+                "time_min": "2024-01-15T09:00:00Z",
+                "time_max": "2024-01-15T17:00:00Z",
+                "duration_minutes": 0,
+                "preferMorning": True,
+            },
+        )
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "duration_minutes" in data["error"]
+        assert "preferMorning" in data["error"]
+        assert len(data["detail"]) == 2
+
+
+class TestValidation422CarriesNoOutcome:
+    """A request-validation 422 on a mutation route carries the validation
+    envelope, not an `outcome` (fix round, item 9): nothing was attempted,
+    so there is no outcome to report. Pins the exception the docs state to
+    "mutation envelopes carry an `outcome`"."""
+
+    @pytest.mark.parametrize(
+        "method,path,kwargs",
+        [
+            pytest.param(
+                "delete", "/calendars/primary/events/event_123?sendUpdates=all", {},
+                id="delete-undeclared-query-key",
+            ),
+            pytest.param(
+                "post", "/bulk-actions",
+                {"json": {"operations": [{"operation": "bogus", "event_id": "e", "calendar_id": "p"}]}},
+                id="bulk-bad-operation",
+            ),
+            pytest.param(
+                "put", "/calendars/primary/events/event_123", {"json": {}},
+                id="put-empty-body",
+            ),
+        ],
+    )
+    def test_422_on_a_mutation_route_is_the_validation_envelope(
+        self, client, mock_proxy_client, method, path, kwargs
+    ):
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 422, response.text
+        body = response.json()
+        assert body["success"] is False
+        assert body["error"]
+        assert isinstance(body["detail"], list) and body["detail"]
+        assert "outcome" not in body
+        assert "results" not in body
+        for name in ("delete_event", "update_event", "patch_event", "get_event"):
+            getattr(mock_proxy_client, name).assert_not_called()
+
+
+# ============================================================================
+# Writable-field coverage and fetch-modify-write round trips (issue #8,
+# second review round)
+#
+# extra="forbid" only holds up if the models declare every field a caller
+# legitimately sends. Two gaps were found: EventPatchRequest lacked fields the
+# create model accepts (transparency, visibility, guestsCan*) plus `status`
+# (Google's documented cancel path), and a fetch -> modify -> PUT of a real
+# Google event 422'd on Google's own server-populated fields (id, etag,
+# htmlLink, ...) and on attendee fields Google returns (id, resource, ...).
+# ============================================================================
+
+
+# Every read-only, server-populated key Google puts on an event it returns.
+# A caller doing fetch -> modify -> write sends these back verbatim; the
+# server strips exactly this set (and nothing else) before forwarding.
+# `outOfOfficeProperties` / `workingLocationProperties` only appear on events
+# of those types; they are folded into this one fixture so the strip set is
+# exercised in full, at the cost of the fixture being a composite.
+GOOGLE_READ_ONLY_EVENT_FIELDS = {
+    "kind": "calendar#event",
+    "etag": '"3181161784712000"',
+    "id": "meeting_001",
+    "htmlLink": "https://www.google.com/calendar/event?eid=bWVldGluZ18wMDE",
+    "created": "2024-01-08T10:00:00.000Z",
+    "updated": "2024-01-15T10:00:00.712Z",
+    "creator": {"email": "owner@example.com", "self": True},
+    "organizer": {"email": "owner@example.com", "self": True},
+    "iCalUID": "recurring_001@google.com",
+    "sequence": 3,
+    "eventType": "default",
+    "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    "recurringEventId": "recurring_001",
+    "originalStartTime": {"dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York"},
+    "privateCopy": False,
+    "locked": False,
+    "attendeesOmitted": False,
+    "endTimeUnspecified": False,
+    "outOfOfficeProperties": {
+        "autoDeclineMode": "declineAllConflictingInvitations",
+        "declineMessage": "Out until Monday",
+    },
+    "workingLocationProperties": {"type": "homeOffice", "homeOffice": {}},
+}
+
+# Keys Google returns that ARE writable but this server does not declare:
+# accepting them would be new write surface, and `conferenceData` is ignored
+# by Google on a write unless `conferenceDataVersion` is sent (this server
+# never sends it). A caller round-tripping a fetched event removes these
+# before writing; Meet and attachment events are the common case. README
+# "Round-tripping a fetched event" names the same five.
+GOOGLE_WRITABLE_UNDECLARED_FIELDS = {
+    "conferenceData": {
+        "entryPoints": [
+            {
+                "entryPointType": "video",
+                "uri": "https://meet.google.com/abc-defg-hij",
+                "label": "meet.google.com/abc-defg-hij",
+            }
+        ],
+        "conferenceSolution": {
+            "key": {"type": "hangoutsMeet"},
+            "name": "Google Meet",
+            "iconUri": "https://fonts.gstatic.com/s/i/productlogos/meet_2020q4/v6/web-512dp/logo_meet_2020q4_color_2x_web_512dp.png",
+        },
+        "conferenceId": "abc-defg-hij",
+    },
+    "attachments": [
+        {
+            "fileUrl": "https://drive.google.com/open?id=1AbCdEfG",
+            "title": "Agenda",
+            "mimeType": "application/vnd.google-apps.document",
+            "iconLink": "https://drive-thirdparty.googleusercontent.com/16/type/application/vnd.google-apps.document",
+            "fileId": "1AbCdEfG",
+        }
+    ],
+    "extendedProperties": {"private": {"crmId": "42"}, "shared": {}},
+    "source": {"url": "https://example.com/tickets/42", "title": "Ticket 42"},
+    "anyoneCanAddSelf": False,
+}
+
+# A Google-shaped attendee entry as Google returns it (all writable/tolerated).
+GOOGLE_ATTENDEE = {
+    "id": "attendee-id-1",
+    "email": "alice@example.com",
+    "displayName": "Alice Smith",
+    "responseStatus": "accepted",
+    "optional": False,
+    "organizer": False,
+    "self": False,
+    "resource": False,
+    "comment": "Joining remotely",
+    "additionalGuests": 1,
+}
+
+
+def google_event_as_fetched() -> dict:
+    """A Meet event as `GET .../events/{id}` returns it: read-only keys,
+    writable-but-undeclared keys, and every declared field."""
+    return {
+        **GOOGLE_READ_ONLY_EVENT_FIELDS,
+        **GOOGLE_WRITABLE_UNDECLARED_FIELDS,
+        "status": "confirmed",
+        "summary": "Team Standup",
+        "description": "Daily standup meeting",
+        "location": "Room 4B",
+        "start": {"dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York"},
+        "end": {"dateTime": "2024-01-15T10:30:00-05:00", "timeZone": "America/New_York"},
+        "attendees": [GOOGLE_ATTENDEE, {"email": "room@example.com", "resource": True}],
+        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
+        "transparency": "opaque",
+        "visibility": "default",
+        "guestsCanInviteOthers": True,
+        "guestsCanModify": False,
+        "guestsCanSeeOtherGuests": True,
+    }
+
+
+def round_trip_body() -> dict:
+    """The fetched event after the removal step the README documents."""
+    return {
+        k: v for k, v in google_event_as_fetched().items()
+        if k not in GOOGLE_WRITABLE_UNDECLARED_FIELDS
+    }
+
+
+class TestPatchAcceptsEveryCreateField:
+    """A field the create model accepts must be patchable too (C4)."""
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("transparency", "transparent"),
+            ("visibility", "private"),
+            ("guestsCanInviteOthers", False),
+            ("guestsCanModify", True),
+            ("guestsCanSeeOtherGuests", False),
+            ("status", "tentative"),
+        ],
+    )
+    def test_patch_forwards_field(self, client, mock_proxy_client, field, value):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={field: value}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {field: value}
+
+    @pytest.mark.parametrize("method", ["post", "put"])
+    def test_status_is_writable_on_create_and_update(self, client, mock_proxy_client, method):
+        path = "/calendars/primary/events" + ("" if method == "post" else "/event_123")
+        response = getattr(client, method)(
+            path, json={"summary": "Standup", "status": "tentative"}
+        )
+        assert response.status_code == 200, response.text
+        forwarder = mock_proxy_client.create_event if method == "post" else mock_proxy_client.update_event
+        assert forwarder.call_args.kwargs["event_data"]["status"] == "tentative"
+
+
+class TestCancelledStatusIsRejected:
+    """`status: "cancelled"` is refused on every write (fix round, item 1).
+
+    A cancel through PUT/PATCH reaches Google with none of the DELETE path's
+    re-read verification and no `outcome`. `status` stays declared (a fetched
+    event carries it) but accepts only `confirmed` / `tentative`; `cancelled`
+    is a 422 that points the caller at DELETE. The rule lives on the shared
+    `EventFields` model, so POST and bulk `updates` get it too.
+    """
+
+    CANCEL = {"summary": "Standup", "status": "cancelled"}
+
+    @pytest.mark.parametrize(
+        "method,path,forwarder",
+        [
+            ("post", "/calendars/primary/events", "create_event"),
+            ("put", "/calendars/primary/events/event_123", "update_event"),
+            ("patch", "/calendars/primary/events/event_123", "patch_event"),
+        ],
+    )
+    def test_single_route_rejects_cancelled_and_points_at_delete(
+        self, client, mock_proxy_client, method, path, forwarder
+    ):
+        response = getattr(client, method)(path, json=self.CANCEL)
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert "DELETE" in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body", "status"]]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    @pytest.mark.parametrize(
+        "operation,forwarder", [("update", "update_event"), ("patch", "patch_event")]
+    )
+    def test_bulk_rejects_cancelled_before_any_operation_runs(
+        self, client, mock_proxy_client, operation, forwarder
+    ):
+        response = client.post("/bulk-actions", json={"operations": [
+            {"operation": "delete", "event_id": "event_0", "calendar_id": "primary"},
+            {"operation": operation, "event_id": "event_1", "calendar_id": "primary",
+             "updates": self.CANCEL},
+        ]})
+        assert response.status_code == 422, response.text
+        assert "DELETE" in response.json()["error"]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+        mock_proxy_client.delete_event.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["confirmed", "tentative"])
+    def test_confirmed_and_tentative_are_still_forwarded(
+        self, client, mock_proxy_client, value
+    ):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={"status": value}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {"status": value}
+
+        response = client.post("/bulk-actions", json={"operations": [
+            {"operation": "update", "event_id": "event_1", "calendar_id": "primary",
+             "updates": {"summary": "Standup", "status": value}},
+        ]})
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.update_event.call_args.kwargs["event_data"]["status"] == value
+
+    def test_any_other_status_value_is_rejected(self, client, mock_proxy_client):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={"status": "maybe"}
+        )
+        assert response.status_code == 422, response.text
+        assert [err["loc"] for err in response.json()["detail"]] == [["body", "status"]]
+        mock_proxy_client.patch_event.assert_not_called()
+
+
+class TestEmptySingleRouteWriteIsRejected:
+    """A PUT/PATCH body that forwards nothing is a 422, exactly like an empty
+    bulk `updates` (fix round, item 2). Before this the single routes sent
+    Google an empty body and reported `success: true`. Emptiness is judged on
+    the forwarded payload -- `{}`, all-null values and read-only-only keys all
+    dump to nothing -- and none may reach the proxy."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({}, id="empty-object"),
+            pytest.param({"summary": None, "location": None}, id="all-null-values"),
+            pytest.param({"id": "event_1", "etag": '"1"'}, id="read-only-keys-only"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "method,operation,forwarder",
+        [("put", "update", "update_event"), ("patch", "patch", "patch_event")],
+    )
+    def test_nothing_to_forward_is_a_422(
+        self, client, mock_proxy_client, method, operation, forwarder, body
+    ):
+        response = getattr(client, method)("/calendars/primary/events/event_1", json=body)
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert f"'{operation}' requires a non-empty payload" in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body"]]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    def test_single_and_bulk_use_the_same_message(self, client, mock_proxy_client):
+        single = client.put("/calendars/primary/events/event_1", json={}).json()["error"]
+        bulk = client.post("/bulk-actions", json={"operations": [
+            {"operation": "update", "event_id": "event_1", "calendar_id": "primary",
+             "updates": {}},
+        ]}).json()["error"]
+        # Same text after the `<loc>: ` prefix the envelope adds.
+        assert single.split(": ", 1)[1] == bulk.split(": ", 1)[1]
+
+
+class TestGoogleEventRoundTrip:
+    """fetch -> modify -> write of a real Google event succeeds (C3), once the
+    caller removes the writable-but-undeclared keys (fix round, item 4)."""
+
+    @pytest.mark.parametrize("method", ["put", "patch"])
+    def test_round_trip_succeeds_and_strips_only_read_only_keys(
+        self, client, mock_proxy_client, method
+    ):
+        body = round_trip_body()
+        body["summary"] = "Team Standup (moved)"
+        response = getattr(client, method)("/calendars/primary/events/meeting_001", json=body)
+        assert response.status_code == 200, response.text
+
+        forwarder = mock_proxy_client.update_event if method == "put" else mock_proxy_client.patch_event
+        forwarded = forwarder.call_args.kwargs["event_data"]
+        for key in GOOGLE_READ_ONLY_EVENT_FIELDS:
+            assert key not in forwarded, f"read-only key {key!r} was forwarded"
+        assert forwarded["summary"] == "Team Standup (moved)"
+        assert forwarded["status"] == "confirmed"
+        assert forwarded["attendees"][0] == GOOGLE_ATTENDEE
+        assert forwarded["attendees"][1] == {"email": "room@example.com", "resource": True}
+        assert forwarded["reminders"]["overrides"][0] == {"method": "popup", "minutes": 10}
+
+    def test_round_trip_through_create_succeeds(self, client, mock_proxy_client):
+        """Duplicating an event by POSTing a fetched one works the same way."""
+        response = client.post("/calendars/primary/events", json=round_trip_body())
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.create_event.call_args.kwargs["event_data"]
+        assert not set(forwarded) & set(GOOGLE_READ_ONLY_EVENT_FIELDS)
+        assert forwarded["summary"] == "Team Standup"
+
+    @pytest.mark.parametrize("method", ["put", "patch"])
+    def test_fetched_event_sent_verbatim_names_exactly_the_undeclared_keys(
+        self, client, mock_proxy_client, method
+    ):
+        """The removal step is real and bounded: sending a fetched Meet event
+        as-is is a 422 on precisely the five writable-but-undeclared keys --
+        none of them is silently stripped, and nothing else is rejected."""
+        response = getattr(client, method)(
+            "/calendars/primary/events/meeting_001", json=google_event_as_fetched()
+        )
+        assert response.status_code == 422, response.text
+        rejected = sorted(err["loc"][-1] for err in response.json()["detail"])
+        assert rejected == sorted(GOOGLE_WRITABLE_UNDECLARED_FIELDS)
+        assert all(err["type"] == "extra_forbidden" for err in response.json()["detail"])
+        mock_proxy_client.update_event.assert_not_called()
+        mock_proxy_client.patch_event.assert_not_called()
+
+    def test_unknown_key_outside_read_only_set_still_rejected(self, client, mock_proxy_client):
+        body = {**round_trip_body(), "titel": "typo"}
+        response = client.put("/calendars/primary/events/meeting_001", json=body)
+        assert response.status_code == 422
+        data = response.json()
+        assert data["detail"] == [
+            {
+                "type": "extra_forbidden",
+                "loc": ["body", "titel"],
+                "msg": "Extra inputs are not permitted",
+                "input": "typo",
+            }
+        ]
+        mock_proxy_client.update_event.assert_not_called()
+
+    @pytest.mark.parametrize("key", sorted(GOOGLE_READ_ONLY_EVENT_FIELDS))
+    def test_read_only_keys_are_not_silently_written_by_a_bare_request(
+        self, client, mock_proxy_client, key
+    ):
+        """Stripping is exactly the named set: a read-only key sent alone is
+        dropped (200, nothing forwarded for it), never forwarded."""
+        response = client.patch(
+            "/calendars/primary/events/meeting_001",
+            json={key: GOOGLE_READ_ONLY_EVENT_FIELDS[key], "location": "Room B"},
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {
+            "location": "Room B"
+        }
+
+
+class TestBulkUpdatesAreTyped:
+    """A bulk operation's `updates` goes through the same strict event model
+    as the single-event routes (C1): an unknown key inside it is a 422, a
+    delete does not carry one, and the payload is dumped the same way."""
+
+    def _bulk(self, client, op):
+        return client.post("/bulk-actions", json={"operations": [op]})
+
+    def test_delete_with_updates_is_rejected(self, client, mock_proxy_client):
+        """A mis-set operation must not DELETE while silently ignoring the payload."""
+        response = self._bulk(client, {
+            "operation": "delete",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {"summary": "meant to patch this"},
+        })
+        assert response.status_code == 422, response.text
+        assert ["body", "operations", 0, "delete", "updates"] in [
+            err["loc"] for err in response.json()["detail"]
+        ]
+        mock_proxy_client.delete_event.assert_not_called()
+
+    def test_updates_are_dumped_like_the_single_routes(self, client, mock_proxy_client):
+        """exclude_none + by_alias + read-only strip, exactly as PUT/PATCH do."""
+        response = self._bulk(client, {
+            "operation": "patch",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {
+                "id": "event_1",
+                "etag": '"1"',
+                "summary": "Renamed",
+                "location": None,
+                "attendees": [{"email": "alice@example.com", "self": True}],
+            },
+        })
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {
+            "summary": "Renamed",
+            "attendees": [{"email": "alice@example.com", "self": True}],
+        }
+
+    @pytest.mark.parametrize(
+        "updates",
+        [
+            pytest.param({}, id="empty-object"),
+            pytest.param({"summary": None}, id="all-null-values"),
+            pytest.param({"id": "event_1", "etag": '"1"'}, id="read-only-keys-only"),
+        ],
+    )
+    def test_empty_updates_payload_rejects_the_whole_batch(
+        self, client, mock_proxy_client, updates
+    ):
+        """An `updates` that forwards nothing is a 422 for the whole request
+        (main's F3 rule), judged on the dumped payload rather than on the
+        raw object: `{}`, all-null values and read-only-only keys all dump to
+        nothing, and none may reach the proxy or be reported per item."""
+        response = self._bulk(client, {
+            "operation": "update",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": updates,
+        })
+        assert response.status_code == 422, response.text
+        assert "'update' requires a non-empty payload" in response.json()["error"]
+        mock_proxy_client.update_event.assert_not_called()
+
+
+class TestBulkOperationTagErrors:
+    """A bad `operation` value gets a fixed message naming the allowed
+    operations (fix round, item 3). Before, the discriminated union's own
+    message leaked Python enum reprs (`<BulkOperationType.DELETE: 'delete'>`)
+    into `error`, `detail[].msg` and `detail[].ctx.expected_tags`."""
+
+    ENUM_REPR = re.compile(r"BulkOperationType|<[A-Za-z_.]+: '")
+    FIXED = "'operation' must be one of 'update', 'delete', 'patch'"
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            pytest.param({"operation": "bogus"}, id="unknown-tag"),
+            pytest.param({}, id="missing-tag"),
+            pytest.param({"operation": None}, id="null-tag"),
+            pytest.param({"operation": []}, id="list-tag"),
+            pytest.param({"operation": {}}, id="object-tag"),
+        ],
+    )
+    def test_bad_operation_tag_gets_a_fixed_message(self, client, mock_proxy_client, op):
+        # An unhashable tag must not turn the 422 into a 500 via `in <set>`.
+        response = client.post("/bulk-actions", json={"operations": [
+            {"event_id": "event_1", "calendar_id": "primary", **op},
+        ]})
+        assert response.status_code == 422, response.text
+        assert not self.ENUM_REPR.search(response.text), response.text
+        data = response.json()
+        assert data["success"] is False
+        assert self.FIXED in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body", "operations", 0]]
+        for name in ("delete_event", "update_event", "patch_event"):
+            getattr(mock_proxy_client, name).assert_not_called()
+
+
+# ============================================================================
+# /search flat-shape fold (issue #8 "shape of the fix" items 2-4)
+#
+# Earlier callers sent /search with the filter keys at the top level
+# ({"calendar_id": ..., "query": ..., "time_min": ...}) rather than nested
+# under "filters"; the flat shape is kept for compatibility with them (the
+# installed calendar skills nest their filters). With extra="forbid" alone
+# that shape went from 200-with-wrong-answer to hard 422. A before-validator folds exactly the
+# keys SearchFilters declares into "filters" (consuming them, so a true typo
+# still 422s); the allowlist is derived from SearchFilters.model_fields, so
+# the fold needs no edit when a filter field is added. The parametrized test
+# below still needs a sample value for the new field, and `search_events`
+# must forward it -- neither is derived.
+# ============================================================================
+
+
+NESTED_SEARCH = {
+    "calendar_id": "primary",
+    "filters": {
+        "query": "project",
+        "time_min": "2024-01-01T00:00:00Z",
+        "time_max": "2024-03-31T23:59:59Z",
+        "max_results": 20,
+        "order_by": "startTime",
+    },
+}
+FLAT_SEARCH = {"calendar_id": "primary", **NESTED_SEARCH["filters"]}
+
+
+class TestSearchFlatShapeFold:
+    """The flat /search shape kept for earlier callers works, and only that shape."""
+
+    def test_flat_shape_gives_the_same_proxy_call_as_nested(self, client, mock_proxy_client):
+        client.post("/search", json=NESTED_SEARCH)
+        nested_call = mock_proxy_client.list_events.call_args.kwargs
+        mock_proxy_client.list_events.reset_mock()
+
+        response = client.post("/search", json=FLAT_SEARCH)
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.list_events.call_args.kwargs == nested_call
+        assert nested_call["time_min"] == "2024-01-01T00:00:00Z"
+        assert nested_call["max_results"] == 20
+
+    def test_flat_shape_with_typo_is_rejected(self, client, mock_proxy_client):
+        """The fold consumes only declared keys: Google-style timeMin is still a 422."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "query": "project", "timeMin": "2024-01-01T00:00:00Z"},
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == [
+            {
+                "type": "extra_forbidden",
+                "loc": ["body", "timeMin"],
+                "msg": "Extra inputs are not permitted",
+                "input": "2024-01-01T00:00:00Z",
+            }
+        ]
+        mock_proxy_client.list_events.assert_not_called()
+
+    @pytest.mark.parametrize("field", list(SearchFilters.model_fields))
+    def test_every_search_filter_field_is_accepted_flat(self, client, mock_proxy_client, field):
+        """Parametrized over SearchFilters.model_fields, so a new filter field
+        is picked up by name -- but it needs a sample value in the mapping
+        below (and a proxy-key entry if the proxy's name differs), and
+        `search_events` must forward it. Until then this test fails for it,
+        which is the point: the fold's allowlist is derived, the rest is not."""
+        value = {"query": "x", "time_min": "2024-01-01T00:00:00Z",
+                 "time_max": "2024-01-02T00:00:00Z", "order_by": "updated"}.get(field)
+        if value is None:
+            annotation = SearchFilters.model_fields[field].annotation
+            value = 7 if annotation is int else True
+        response = client.post("/search", json={"calendar_id": "primary", field: value})
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        # the flat key reached the proxy call under its SearchFilters name
+        proxy_key = {"query": "q"}.get(field, field)
+        assert forwarded[proxy_key] == value
+
+    def test_nested_wins_per_field_on_conflict(self, client, mock_proxy_client):
+        response = client.post(
+            "/search",
+            json={
+                "calendar_id": "primary",
+                "time_min": "FLAT-MIN",
+                "time_max": "FLAT-MAX",
+                "filters": {"time_min": "NESTED-MIN"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        assert forwarded["time_min"] == "NESTED-MIN"
+        assert forwarded["time_max"] == "FLAT-MAX"
+
+    def test_explicit_null_flat_keys_mean_not_supplied(self, client, mock_proxy_client):
+        """A client that serializes every optional field as null gets defaults, not a 422."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "query": None, "time_min": None,
+                  "max_results": None, "order_by": None, "show_deleted": None},
+        )
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        assert forwarded["max_results"] == 100
+        assert forwarded["show_deleted"] is False
+
+    @pytest.mark.parametrize("bad_filters", ["oops", [], 0, ""])
+    def test_malformed_filters_with_flat_keys_is_a_clean_422(
+        self, client, mock_proxy_client, bad_filters
+    ):
+        """PR #1's regressions: a non-mapping `filters` alongside a flat key
+        was a 500 (TypeError), and `or {}` turned []/""/0 into defaults."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "time_min": "2024-01-01T00:00:00Z",
+                  "filters": bad_filters},
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["success"] is False
+        assert ["body", "filters"] in [err["loc"][:2] for err in response.json()["detail"]]
+        mock_proxy_client.list_events.assert_not_called()
+
+
+# ============================================================================
+# Unknown query-string keys (C2)
+#
+# Body fields are strict, but FastAPI ignores undeclared query parameters:
+# GET /calendars/x/events?timeMin=..&timeMax=.. ran an unbounded list, and
+# ?sendUpdates=all on a write meant nobody was emailed while the caller was
+# told success. A shared dependency now 422s any query key the route does
+# not declare.
+# ============================================================================
+
+
+class TestUnknownQueryParamsRejected:
+    """An undeclared query-string key is a 422, not silently ignored."""
+
+    def test_google_style_time_bounds_on_list_events(self, client, mock_proxy_client):
+        response = client.get(
+            "/calendars/primary/events",
+            params={"timeMin": "2026-01-01T00:00:00Z", "timeMax": "2026-02-01T00:00:00Z",
+                    "maxResults": 5},
+        )
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert [err["loc"] for err in data["detail"]] == [
+            ["query", "timeMin"], ["query", "timeMax"], ["query", "maxResults"]
+        ]
+        assert all(err["type"] == "extra_forbidden" for err in data["detail"])
+        assert "timeMin" in data["error"]
+        mock_proxy_client.list_events.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            pytest.param("post", "/calendars/primary/events", {"summary": "s"}, id="POST create"),
+            pytest.param("put", "/calendars/primary/events/e1", {"summary": "s"}, id="PUT update"),
+            pytest.param("patch", "/calendars/primary/events/e1", {"summary": "s"}, id="PATCH patch"),
+            pytest.param("delete", "/calendars/primary/events/e1", None, id="DELETE delete"),
+        ],
+    )
+    def test_camelcase_send_updates_on_writes(self, client, mock_proxy_client, method, path, body):
+        kwargs = {"json": body} if body is not None else {}
+        response = getattr(client, method)(path, params={"sendUpdates": "all"}, **kwargs)
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"] == ["query", "sendUpdates"]
+        for forwarder in ("create_event", "update_event", "patch_event", "delete_event"):
+            getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    def test_declared_query_params_still_accepted(self, client, mock_proxy_client):
+        response = client.get(
+            "/calendars/primary/events",
+            params={"time_min": "2026-01-01T00:00:00Z", "max_results": 5, "q": "x",
+                    "single_events": "false", "order_by": "updated", "page_token": "t",
+                    "time_max": "2026-02-01T00:00:00Z"},
+        )
+        assert response.status_code == 200, response.text
+        response = client.post(
+            "/calendars/primary/events", params={"send_updates": "all"}, json={"summary": "s"}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.create_event.call_args.kwargs["send_updates"] == "all"
+
+    def test_route_with_no_query_params_rejects_any_key(self, client, mock_proxy_client):
+        response = client.post(
+            "/search", params={"max_results": 5}, json={"calendar_id": "primary"}
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"] == ["query", "max_results"]
+        mock_proxy_client.list_events.assert_not_called()
+
+    def test_query_key_error_is_reported_alone_and_masks_body_errors(
+        self, client, mock_proxy_client
+    ):
+        """The query guard is an app-level dependency and raises before the
+        body is validated, so a request with both an undeclared query key and
+        a bad body reports only the query key (README "What a 422 looks
+        like" says so; fix round, item 6). Fix the query string, resend, and
+        the body errors appear."""
+        response = client.patch(
+            "/calendars/primary/events/event_123?sendUpdates=all",
+            json={"titel": "typo", "status": "cancelled"},
+        )
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert [err["loc"] for err in detail] == [["query", "sendUpdates"]]
+        assert response.json()["error"] == "query.sendUpdates: Extra inputs are not permitted"
+        mock_proxy_client.patch_event.assert_not_called()
+
+    def test_every_route_is_guarded(self, client, subtests):
+        """Walk the app's own routes: none of them may accept a bogus query key."""
+        from tests.test_readme_documentation import get_all_endpoints
+
+        for method, path in get_all_endpoints():
+            with subtests.test(endpoint=f"{method} {path}"):
+                url = path.replace("{calendar_id}", "primary").replace("{event_id}", "e1")
+                kwargs = {"json": {}} if method in ("POST", "PUT", "PATCH") else {}
+                response = getattr(client, method.lower())(
+                    url, params={"bogus_query_key": "x"}, **kwargs
+                )
+                assert response.status_code == 422, f"{method} {path}: {response.text}"
+                assert ["query", "bogus_query_key"] in [
+                    err["loc"] for err in response.json()["detail"]
+                ]

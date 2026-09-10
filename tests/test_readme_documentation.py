@@ -251,3 +251,18 @@ def test_refusal_docs_name_the_identity_lookup_and_its_502(subtests):
             assert re.search(r"nothing (?:was |is )?sent", passage), (
                 f"{name} does not say a failed lookup sends nothing"
             )
+
+
+def test_readme_lists_every_stripped_read_only_event_field(subtests):
+    """The set of Google read-only keys the event-write routes strip (instead
+    of rejecting) is a documented contract: every name in the code's set must
+    appear in the README, and the README must name the set's purpose."""
+    from calendar_agent.calendar_server import GOOGLE_READ_ONLY_EVENT_FIELDS
+
+    readme_content = README_PATH.read_text()
+    assert "Round-tripping a fetched event" in readme_content
+    for field in sorted(GOOGLE_READ_ONLY_EVENT_FIELDS):
+        with subtests.test(field=field):
+            assert f"`{field}`" in readme_content, (
+                f"README.md does not list stripped read-only field `{field}`"
+            )

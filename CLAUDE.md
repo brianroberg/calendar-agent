@@ -98,11 +98,19 @@ uv run pytest --cov=calendar_agent  # With coverage
   404 absent (`ProxyNotFoundError`), 504 outcome unknown, 502 upstream
   proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
   delete the proxy claimed but the re-read contradicts), 500 unexpected —
-  never 200 for a failure. Caller errors are 422 from request validation
-  (no envelope), raised *before* anything is sent upstream — e.g.
-  `BulkOperation`'s validator requiring `updates` for update/patch
+  never 200 for a failure. Caller errors are 422 from request validation,
+  raised *before* anything is sent upstream — e.g. `EventUpdateRequest` /
+  `EventPatchRequest` refusing a body that would forward nothing
+  (`_require_forwardable_payload`), which covers PUT, PATCH and bulk
+  `updates` from one place
+- 422s carry the same envelope: the `RequestValidationError` handler
+  (`validation_error_envelope`) returns `{"success": false, "error":
+  "<loc>: <msg>; ...", "detail": [...]}` — keep `detail`, callers read it
 - Every mutation envelope carries an `outcome` (`OperationOutcome`):
-  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
+  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items —
+  except a request-validation 422, which carries the validation envelope
+  above instead (nothing was attempted, so there is no outcome to report;
+  `TestValidation422CarriesNoOutcome` pins this).
   Never collapse `unknown` into `failed`: a timed-out mutation may still be
   applied when the operator approves it, and treating that as failure is what
   produced the duplicate-event incident in issue #4
@@ -152,6 +160,31 @@ uv run pytest --cov=calendar_agent  # With coverage
   merge for any of this to take effect
 - It is covered end to end by `tests/test_delete_event_script.py`, which runs
   the real script against a loopback stub of calendar-agent
+
+### Request Validation (issue #8)
+
+- Every request body model extends `StrictRequestModel` (`extra="forbid"`),
+  nested ones included; `tests/test_calendar_server.py::TestRequestModelsAreStrict`
+  walks the routes and fails on any model that doesn't, or on any request
+  field typed as a bare `dict` (that would forward unknown keys verbatim)
+- Undeclared query-string keys are a 422 too, via the app-level
+  `reject_unknown_query_params` dependency; the allowed set is the route's
+  own declared parameters, so nothing to maintain when adding one
+- Event write bodies (create / PUT / PATCH / bulk `updates`) share
+  `EventFields`; add a new Google event field there, once. Google's
+  server-populated read-only keys are stripped by the named
+  `GOOGLE_READ_ONLY_EVENT_FIELDS` set so fetched events round-trip — keep
+  that set and the README list in sync
+- `/search` accepts filter keys flat or nested; the fold derives its
+  allowlist from `SearchFilters.model_fields`, so the fold itself needs no
+  edit when a filter field is added. Adding one still means: forward it in
+  `search_events` (and the proxy client), give
+  `test_every_search_filter_field_is_accepted_flat` a sample value (and a
+  proxy-key entry if the proxy's name differs), and list it in the README
+  `/search` section. That test derives field *names* from `model_fields`,
+  not values, so a new field fails it until it is forwarded and given a value
+- Document every accepted field in README.md — the strict models make the
+  README the contract callers must match
 
 ## Testing Guidelines
 

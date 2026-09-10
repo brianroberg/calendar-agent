@@ -22,12 +22,14 @@ and enforces security policies.
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
 from .calendar_utils import (
@@ -62,11 +64,61 @@ load_dotenv()
 # FastAPI App Setup
 # ============================================================================
 
+async def reject_unknown_query_params(request: Request) -> None:
+    """422 any query-string key the matched route does not declare.
+
+    FastAPI ignores undeclared query parameters, which is the same silent
+    wrong answer as an ignored body field (issue #8): `?timeMin=..` on the
+    events list ran an unbounded list, `?sendUpdates=all` on a write emailed
+    nobody while reporting success. The allowed set is derived from the
+    route's own declared query parameters, so there is no list to maintain.
+    Applied to every route via the app-level dependency below.
+    """
+    route = request.scope.get("route")
+    if route is None:
+        return
+    allowed = {param.alias for param in route.dependant.query_params}
+    unknown = [key for key in request.query_params if key not in allowed]
+    if unknown:
+        raise RequestValidationError([
+            {
+                "type": "extra_forbidden",
+                "loc": ("query", key),
+                "msg": "Extra inputs are not permitted",
+                "input": request.query_params[key],
+            }
+            for key in unknown
+        ])
+
+
 app = FastAPI(
     title="Calendar Agent",
     description="A privacy-focused FastAPI server for Google Calendar operations with AI agents",
     version=__version__,
+    dependencies=[Depends(reject_unknown_query_params)],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_envelope(request: Request, exc: RequestValidationError):
+    """Return 422s in the same success/error envelope as every other failure.
+
+    FastAPI's default 422 body is {"detail": [...]} with no `success` or
+    `error` key. With unknown fields rejected (issue #8) a 422 is the main way
+    a misnamed field now fails, and callers that read the envelope (e.g. the
+    briefing skills' `jq 'if .success then .briefing else "Error: " + .error
+    end'`) would render a blank error. `detail` is kept for clients that read
+    FastAPI's structure.
+    """
+    errors = jsonable_encoder(exc.errors())
+    message = "; ".join(
+        f"{'.'.join(str(part) for part in err.get('loc', ()))}: {err.get('msg', '')}"
+        for err in errors
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "error": message, "detail": errors},
+    )
 
 
 # ============================================================================
@@ -74,37 +126,87 @@ app = FastAPI(
 # ============================================================================
 
 
-class EventDateTime(BaseModel):
+class StrictRequestModel(BaseModel):
+    """Base for every request body model, top-level and nested: an unknown key
+    is a 422, not a silent drop. Rationale in README "Error Responses"; issue #8.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EventDateTime(StrictRequestModel):
     """DateTime specification for calendar events."""
     date: str | None = Field(None, description="Date for all-day events (YYYY-MM-DD)")
     dateTime: str | None = Field(None, description="DateTime for timed events (RFC3339)")
     timeZone: str | None = Field(None, description="Timezone (e.g., 'America/New_York')")
 
 
-class EventAttendee(BaseModel):
-    """Event attendee."""
+class EventAttendee(StrictRequestModel):
+    """Event attendee, as Google returns it (so a fetched list round-trips)."""
     email: str
+    id: str | None = Field(None, description="Google's attendee id (round-tripped)")
     displayName: str | None = None
     responseStatus: str | None = None
     optional: bool | None = None
     organizer: bool | None = None
     self_: bool | None = Field(None, alias="self")
+    resource: bool | None = Field(None, description="True for a booked room/resource")
+    comment: str | None = Field(None, description="The attendee's response comment")
+    additionalGuests: int | None = Field(None, ge=0, description="Extra guests")
 
 
-class EventReminder(BaseModel):
+class EventReminder(StrictRequestModel):
     """Event reminder."""
     method: str
     minutes: int
 
 
-class EventReminders(BaseModel):
+class EventReminders(StrictRequestModel):
     """Event reminders configuration."""
     useDefault: bool = True
     overrides: list[EventReminder] | None = None
 
 
-class EventCreateRequest(BaseModel):
-    """Request body for creating a new event."""
+# Server-populated, read-only keys Google puts on the events it returns. A
+# caller doing fetch -> modify -> write sends them back verbatim; Google
+# tolerates that, so these -- and ONLY these -- are stripped before the
+# extra="forbid" check instead of being rejected. Documented in README.md
+# next to the "Unknown fields are rejected" paragraph; keep the two in sync.
+# Writable keys Google also returns but this server does not declare
+# (`conferenceData`, `attachments`, `extendedProperties`, `source`,
+# `anyoneCanAddSelf`) are deliberately NOT here: stripping them would make
+# a write silently drop what the caller sent, and declaring them is new
+# write surface. The README tells callers to remove them.
+GOOGLE_READ_ONLY_EVENT_FIELDS: frozenset[str] = frozenset({
+    "kind",
+    "etag",
+    "id",
+    "htmlLink",
+    "hangoutLink",
+    "created",
+    "updated",
+    "creator",
+    "organizer",
+    "iCalUID",
+    "sequence",
+    "eventType",
+    "recurringEventId",
+    "originalStartTime",
+    "privateCopy",
+    "locked",
+    "attendeesOmitted",
+    "endTimeUnspecified",
+    "outOfOfficeProperties",
+    "workingLocationProperties",
+})
+
+
+class EventFields(StrictRequestModel):
+    """Every writable Google event field this server forwards.
+
+    Shared by the create, update (PUT) and patch bodies so that a field one
+    write route accepts is accepted by all of them (issue #8, review round 2).
+    """
     summary: str | None = Field(None, description="Event title")
     description: str | None = Field(None, description="Event description")
     location: str | None = Field(None, description="Event location")
@@ -114,29 +216,93 @@ class EventCreateRequest(BaseModel):
     reminders: EventReminders | None = Field(None, description="Reminder settings")
     recurrence: list[str] | None = Field(None, description="Recurrence rules (RRULE)")
     colorId: str | None = Field(None, description="Color ID")
+    # Declared so a fetched event round-trips, but `cancelled` is refused: a
+    # cancel through an update reaches Google with none of the DELETE path's
+    # re-read verification and no `outcome` (PR #12 review, item 1).
+    status: Literal["confirmed", "tentative"] | None = Field(
+        None,
+        description="'confirmed' or 'tentative'. To cancel an event use DELETE, which "
+        "verifies the deletion; 'cancelled' here is a 422",
+    )
     transparency: str | None = Field(None, description="'opaque' or 'transparent'")
     visibility: str | None = Field(None, description="'default', 'public', 'private'")
     guestsCanInviteOthers: bool | None = None
     guestsCanModify: bool | None = None
     guestsCanSeeOtherGuests: bool | None = None
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def _cancel_goes_through_delete(cls, value: Any) -> Any:
+        """Name the right route instead of a bare "not a permitted value"."""
+        if value == "cancelled":
+            raise ValueError(
+                "'status: cancelled' is not accepted on a write. Cancel the event "
+                "with DELETE /calendars/{calendar_id}/events/{event_id}, which "
+                "verifies the deletion and reports an outcome"
+            )
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_google_read_only_fields(cls, data: Any) -> Any:
+        """Drop Google's server-populated keys so a fetched event round-trips.
+
+        Runs before the extra="forbid" check. Only the named set is dropped;
+        any other undeclared key is still rejected.
+        """
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if k not in GOOGLE_READ_ONLY_EVENT_FIELDS}
+        return data
+
+    def forwarded_data(self) -> dict[str, Any]:
+        """The payload as sent upstream: nulls and read-only keys are gone.
+
+        The one dump every write route and bulk `updates` uses, so "does this
+        body forward anything" is judged the same way everywhere.
+        """
+        return self.model_dump(exclude_none=True, by_alias=True)
+
+
+def empty_write_payload_message(operation: str) -> str:
+    """The 422 text for an update/patch that would forward nothing. Shared by
+    the single routes and bulk `updates` so both paths say the same thing."""
+    return (
+        f"'{operation}' requires a non-empty payload: nothing would be sent once "
+        "null values and Google's read-only keys are dropped"
+    )
+
+
+def _require_forwardable_payload(event: EventFields, operation: str) -> EventFields:
+    # Validated with the request, so it is a 422 before anything is sent
+    # upstream. Judged on the forwarded payload, not the model object (which
+    # is always truthy): `{}`, all-null values and read-only-only keys are
+    # empty. Before PR #12's fix round the single routes sent Google an empty
+    # body and reported success; bulk already refused (main's F3 rule).
+    if not event.forwarded_data():
+        raise ValueError(empty_write_payload_message(operation))
+    return event
+
+
+class EventCreateRequest(EventFields):
+    """Request body for creating a new event."""
+
 
 class EventUpdateRequest(EventCreateRequest):
-    """Request body for updating an event (full replacement)."""
-    pass
+    """Request body for updating an event (full replacement). Must forward
+    at least one field; used by PUT and by bulk `update`."""
+
+    @model_validator(mode="after")
+    def _needs_a_payload(self) -> "EventUpdateRequest":
+        return _require_forwardable_payload(self, "update")
 
 
-class EventPatchRequest(BaseModel):
-    """Request body for partially updating an event."""
-    summary: str | None = None
-    description: str | None = None
-    location: str | None = None
-    start: EventDateTime | None = None
-    end: EventDateTime | None = None
-    attendees: list[EventAttendee] | None = None
-    reminders: EventReminders | None = None
-    recurrence: list[str] | None = None
-    colorId: str | None = None
+class EventPatchRequest(EventFields):
+    """Request body for partially updating an event. Must forward at least
+    one field; used by PATCH and by bulk `patch`."""
+
+    @model_validator(mode="after")
+    def _needs_a_payload(self) -> "EventPatchRequest":
+        return _require_forwardable_payload(self, "patch")
 
 
 # Rendered into the field descriptions below so /openapi.json lists exactly
@@ -145,7 +311,7 @@ _RSVP_RESPONSE_LIST = ", ".join(f"'{v}'" for v in RSVP_RESPONSES)
 _READ_STATUS_LIST = ", ".join(f"'{v}'" for v in READ_RESPONSE_STATUSES)
 
 
-class RespondRequest(BaseModel):
+class RespondRequest(StrictRequestModel):
     """Request body for RSVPing to an event.
 
     The proxy writes the AUTHENTICATED USER's own attendee entry, found by
@@ -169,28 +335,28 @@ class RespondRequest(BaseModel):
     )
 
 
-class SummarizeRequest(BaseModel):
+class SummarizeRequest(StrictRequestModel):
     """Request to summarize an event."""
     calendar_id: str = Field(..., description="Calendar ID containing the event")
     event_id: str = Field(..., description="Event ID to summarize")
     format: str = Field("brief", description="'brief' or 'detailed'")
 
 
-class AskAboutRequest(BaseModel):
+class AskAboutRequest(StrictRequestModel):
     """Request to ask a question about an event."""
     calendar_id: str = Field(..., description="Calendar ID containing the event")
     event_id: str = Field(..., description="Event ID to ask about")
     question: str = Field(..., description="Question to ask about the event")
 
 
-class BatchSummarizeRequest(BaseModel):
+class BatchSummarizeRequest(StrictRequestModel):
     """Request to summarize multiple events."""
     calendar_id: str = Field(..., description="Calendar ID containing the events")
     event_ids: list[str] = Field(..., description="List of event IDs to summarize")
     triage: bool = Field(False, description="Include action type classification")
 
 
-class FindFreeTimeRequest(BaseModel):
+class FindFreeTimeRequest(StrictRequestModel):
     """Request to find free time slots."""
     calendar_id: str = Field(..., description="Calendar ID to check")
     time_min: str = Field(..., description="Start of search range (RFC3339)")
@@ -202,7 +368,7 @@ class FindFreeTimeRequest(BaseModel):
     prefer_afternoon: bool = Field(False, description="Prefer afternoon times")
 
 
-class AnalyzeScheduleRequest(BaseModel):
+class AnalyzeScheduleRequest(StrictRequestModel):
     """Request to analyze schedule patterns."""
     calendar_id: str = Field(..., description="Calendar ID to analyze")
     time_min: str = Field(..., description="Start of analysis period (RFC3339)")
@@ -213,7 +379,7 @@ class AnalyzeScheduleRequest(BaseModel):
     )
 
 
-class PrepareBriefingRequest(BaseModel):
+class PrepareBriefingRequest(StrictRequestModel):
     """Request to prepare a schedule briefing."""
     calendar_id: str = Field(..., description="Calendar ID for briefing")
     briefing_type: str = Field("daily", description="'daily' or 'weekly'")
@@ -221,7 +387,7 @@ class PrepareBriefingRequest(BaseModel):
     time_max: str | None = Field(None, description="End time (defaults based on type)")
 
 
-class SearchFilters(BaseModel):
+class SearchFilters(StrictRequestModel):
     """Filters for event search."""
     query: str | None = Field(None, description="Free text search")
     time_min: str | None = Field(None, description="Start of time range (RFC3339)")
@@ -231,10 +397,46 @@ class SearchFilters(BaseModel):
     show_deleted: bool = Field(False, description="Include deleted events")
 
 
-class SearchRequest(BaseModel):
-    """Request to search events."""
+class SearchRequest(StrictRequestModel):
+    """Request to search events.
+
+    Accepts the filter keys either nested under `filters` (the shape
+    /openapi.json describes) or flat at the top level (kept for compatibility
+    with earlier callers; the installed skills nest theirs); see
+    `_fold_flat_filter_keys`.
+    """
     calendar_id: str = Field(..., description="Calendar ID to search")
     filters: SearchFilters = Field(default_factory=SearchFilters)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_flat_filter_keys(cls, data: Any) -> Any:
+        """Move top-level filter keys into `filters` (issue #8, items 2-4).
+
+        - The allowlist is `SearchFilters.model_fields`, never a hand copy,
+          so adding a filter field keeps the flat shape working.
+        - Folded keys are consumed from the top level; anything else left
+          there still hits extra="forbid", so a true typo (`timeMin`) is a 422.
+        - Merge is per field, nested wins: a key present in `filters` beats
+          the same key at the top level.
+        - An explicit null at the top level means "not supplied".
+        - `filters` is only touched when it is absent/null or a mapping; any
+          other value is left for SearchFilters to reject cleanly (no 500).
+        """
+        if not isinstance(data, dict):
+            return data
+        flat = {k: v for k, v in data.items() if k in SearchFilters.model_fields}
+        if not flat:
+            return data
+        rest = {k: v for k, v in data.items() if k not in flat}
+        nested = rest.get("filters")
+        if nested is None:
+            nested = {}
+        elif not isinstance(nested, dict):
+            return data  # let the field validator report the bad `filters`
+        merged = {k: v for k, v in flat.items() if v is not None}
+        merged.update(nested)
+        return {**rest, "filters": merged}
 
 
 class BulkOperationType(str, Enum):
@@ -244,30 +446,83 @@ class BulkOperationType(str, Enum):
     PATCH = "patch"
 
 
-class BulkOperation(BaseModel):
-    """A single operation in a bulk request."""
-    operation: BulkOperationType
+class _BulkOperationBase(StrictRequestModel):
+    """Fields every bulk operation carries."""
     event_id: str
     calendar_id: str
-    updates: dict[str, Any] | None = Field(
-        None, description="Update data (required for update/patch operations)"
-    )
     send_updates: str | None = Field(None, description="'all', 'externalOnly', 'none'")
 
-    @model_validator(mode="after")
-    def _writes_need_a_payload(self) -> "BulkOperation":
-        # Validated with the request, so a malformed operation anywhere in the
-        # batch is a 422 before any operation runs. Discovering it mid-loop
-        # left the envelope's status depending on operation order (F3).
-        needs_payload = self.operation in (BulkOperationType.UPDATE, BulkOperationType.PATCH)
-        if needs_payload and not self.updates:
-            raise ValueError(
-                f"'{self.operation.value}' requires a non-empty 'updates' payload"
-            )
-        return self
+
+class BulkDeleteOperation(_BulkOperationBase):
+    """Delete one event. Carries no `updates` -- sending one is a 422, so a
+    mis-set operation can't delete while its payload is silently ignored."""
+    operation: Literal[BulkOperationType.DELETE]
 
 
-class BulkActionsRequest(BaseModel):
+class _BulkWriteOperation(_BulkOperationBase):
+    """An update or patch: `updates` is required. Subclasses narrow `updates`
+    to the matching single-event body, so an unknown key inside it is rejected
+    at the same depth as on the single-event routes (issue #8) and an empty
+    payload is refused by that body's own validator -- with the request, so a
+    malformed operation anywhere in the batch is a 422 before any operation
+    runs (F3: discovering it mid-loop left the envelope's status depending on
+    operation order)."""
+    operation: BulkOperationType
+    updates: EventFields = Field(..., description="Update data")
+
+    @property
+    def event_data(self) -> dict[str, Any]:
+        """The payload as forwarded: same dump as the single-event routes."""
+        return self.updates.forwarded_data()
+
+
+class BulkUpdateOperation(_BulkWriteOperation):
+    """Full replacement of one event; `updates` is validated exactly like PUT."""
+    operation: Literal[BulkOperationType.UPDATE]
+    updates: EventUpdateRequest = Field(..., description="Full event body")
+
+
+class BulkPatchOperation(_BulkWriteOperation):
+    """Partial update of one event; `updates` is validated exactly like PATCH."""
+    operation: Literal[BulkOperationType.PATCH]
+    updates: EventPatchRequest = Field(..., description="Fields to change")
+
+
+_BULK_OPERATION_NAMES = ", ".join(f"'{op.value}'" for op in BulkOperationType)
+_BULK_OPERATION_VALUES = frozenset(op.value for op in BulkOperationType)
+
+
+def _check_bulk_operation_tag(item: Any) -> Any:
+    """Report an absent or unknown `operation` in fixed words.
+
+    Runs before the discriminated union below, whose own message for a bad
+    tag spells the expected tags as Python enum reprs
+    (`<BulkOperationType.DELETE: 'delete'>`) -- in `error`, `detail[].msg`
+    and `ctx.expected_tags` alike (PR #12 review, item 3). Anything that is
+    not a mapping is left for the union to reject.
+    """
+    if not isinstance(item, dict):
+        return item
+    tag = item.get("operation")
+    # The `isinstance` guard keeps an unhashable tag (a list or object) from
+    # raising TypeError out of the set lookup, which would be a 500 not a 422.
+    if not (isinstance(tag, str) and tag in _BULK_OPERATION_VALUES):
+        got = f"got {tag!r}" if "operation" in item else "it is missing"
+        raise ValueError(f"'operation' must be one of {_BULK_OPERATION_NAMES}; {got}")
+    return item
+
+
+# Discriminated on `operation`, so `updates` is typed by the operation it
+# accompanies and an unknown key inside it is rejected at the same depth as
+# on the single-event routes (issue #8).
+BulkOperation = Annotated[
+    BulkDeleteOperation | BulkUpdateOperation | BulkPatchOperation,
+    Field(discriminator="operation"),
+    BeforeValidator(_check_bulk_operation_tag),
+]
+
+
+class BulkActionsRequest(StrictRequestModel):
     """Request for bulk operations on events."""
     operations: list[BulkOperation] = Field(..., min_length=1)
 
@@ -665,7 +920,7 @@ async def verified_delete(
 
 
 async def gated_write(
-    client, op: BulkOperation
+    client, op: BulkUpdateOperation | BulkPatchOperation
 ) -> OperationVerdict:
     """Run a bulk update/patch and map its answer to a verdict."""
     write = (
@@ -677,7 +932,7 @@ async def gated_write(
         await write(
             calendar_id=op.calendar_id,
             event_id=op.event_id,
-            event_data=op.updates,
+            event_data=op.event_data,
             send_updates=op.send_updates,
         )
     except ProxyTimeoutError as e:
@@ -962,7 +1217,7 @@ async def create_event(
     try:
         client = get_calendar_client()
         # Convert Pydantic model to dict, excluding None values
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.create_event(
             calendar_id=calendar_id,
@@ -1015,7 +1270,7 @@ async def update_event(
     """Update an event (full replacement)."""
     try:
         client = get_calendar_client()
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.update_event(
             calendar_id=calendar_id,
@@ -1044,7 +1299,7 @@ async def patch_event(
     """Partially update an event."""
     try:
         client = get_calendar_client()
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.patch_event(
             calendar_id=calendar_id,
