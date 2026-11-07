@@ -5,6 +5,11 @@
 #
 # Environment:
 #   CALENDAR_AGENT_URL              base URL of calendar-agent (required)
+#   CALENDAR_AGENT_API_KEY          this caller's bearer token, sent as
+#                                   `Authorization: Bearer <token>` on both
+#                                   requests. Needed when calendar-agent
+#                                   requires one (CALENDAR_AGENT_AUTH=required);
+#                                   when unset, no Authorization header is sent.
 #   CALENDAR_AGENT_CONFIRM_TIMEOUT  calendar-agent's own mutation budget in
 #                                   seconds — its PROXY_CONFIRM_TIMEOUT
 #                                   (default 330). The script cannot read it
@@ -37,7 +42,9 @@
 #                     calendar id) did not exist before this script ran, so
 #                     nothing was deleted. A re-read that also 404s is not
 #                     evidence of a completed deletion; check the id.
-#   exit 4  USAGE     bad arguments or configuration; nothing was attempted
+#   exit 4  USAGE     bad arguments or configuration; nothing was attempted.
+#                     Includes calendar-agent refusing the bearer token (its
+#                     401 comes before the request reaches any route).
 #
 # Callers must treat exit 2 as "do not act": in particular, never create a
 # replacement event until a delete is observed complete.
@@ -88,6 +95,21 @@ enc_evt=$(enc "$EVENT_ID") || usage "could not URL-encode the event id (is pytho
 
 URL="$CALENDAR_AGENT_URL/calendars/$enc_cal/events/$enc_evt"
 
+# Every request to calendar-agent goes through here. The token reaches curl on
+# stdin (`-H @-`, curl 7.55+), never on its command line, which any process on
+# the machine can read. The script does not print it, but tracing (`bash -x`)
+# prints each command as expanded, the token included: do not trace a run
+# with a real token.
+API_KEY="${CALENDAR_AGENT_API_KEY:-}"
+API_KEY="${API_KEY//[[:space:]]/}"
+agent_curl() {
+    if [ -n "$API_KEY" ]; then
+        printf 'Authorization: Bearer %s\n' "$API_KEY" | curl -H @- "$@"
+    else
+        curl "$@"
+    fi
+}
+
 # Read a field out of a JSON body without assuming it parses at all.
 json_field() {
     printf '%s' "$1" | python3 -c '
@@ -124,7 +146,7 @@ is_envelope() { case "$1" in true|false) return 0 ;; *) return 1 ;; esac; }
 # 1. Ask for the deletion. Capture body *and* status; a discarded body is how
 #    a 200/success:false got read as success on 2026-08-07.
 # ---------------------------------------------------------------------------
-resp=$(curl -s --max-time "$MAX_TIME" -w '\n%{http_code}' -X DELETE "$URL" 2>/dev/null)
+resp=$(agent_curl -s --max-time "$MAX_TIME" -w '\n%{http_code}' -X DELETE "$URL" 2>/dev/null)
 curl_rc=$?
 
 if [ "$curl_rc" -ne 0 ]; then
@@ -146,6 +168,14 @@ else
             204)                    claim="deleted" ;;
             200) [ "$body_success" = "true" ] && claim="deleted" || claim="failed" ;;
             404|410)                claim="absent" ;;
+            # calendar-agent checks the token before the request reaches a
+            # route, so its 401 means nothing was attempted. No re-read: it
+            # would be refused the same way and establish nothing.
+            401)
+                usage "calendar-agent refused the bearer token (HTTP 401): set" \
+                      "CALENDAR_AGENT_API_KEY to a token this calendar-agent is" \
+                      "configured with. Nothing was attempted."
+                ;;
             # 408/504: calendar-agent gave up waiting for the operator.
             # Other 5xx: calendar-agent hit a fault *after* the request may
             # have reached the proxy, where it can stay queued for approval.
@@ -159,7 +189,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Re-read the event. This, not the answer above, is what decides.
 # ---------------------------------------------------------------------------
-vresp=$(curl -s --max-time "$VERIFY_MAX_TIME" -w '\n%{http_code}' "$URL" 2>/dev/null)
+vresp=$(agent_curl -s --max-time "$VERIFY_MAX_TIME" -w '\n%{http_code}' "$URL" 2>/dev/null)
 vcurl_rc=$?
 
 if [ "$vcurl_rc" -ne 0 ]; then

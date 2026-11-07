@@ -14,6 +14,7 @@ Calendar Agent is a FastAPI server that provides a privacy-focused interface bet
 ## File Structure
 
 - `calendar_agent/calendar_server.py` - Main FastAPI app with all endpoints
+- `calendar_agent/auth.py` - Bearer-token settings and the check in front of the app
 - `calendar_agent/proxy_client.py` - HTTP client for api-proxy server
 - `calendar_agent/llm_service.py` - LLM provider abstraction
 - `calendar_agent/calendar_utils.py` - Utility functions
@@ -48,6 +49,61 @@ uv run pytest --cov=calendar_agent  # With coverage
 2. Add the endpoint function with FastAPI decorators
 3. Add tests in `test_calendar_server.py`
 4. Document in README.md (required by documentation tests)
+
+### Authentication (issue #15)
+
+- Every route but `/health` needs `Authorization: Bearer <token>`. The check
+  is `BearerAuthMiddleware` in `calendar_agent/auth.py`, added once in
+  `calendar_server.py` in front of the whole app. A new route is covered by
+  doing nothing: do not add a per-route auth dependency, and do not move the
+  check behind routing (it must stay ahead of validation and of the proxy's
+  operator-approval wait)
+- Keep `BearerAuthMiddleware` the outermost user middleware: `add_middleware`
+  puts each new middleware in front of the earlier ones, and one in front of
+  the check sees and can answer a request before its token is checked. Add
+  any new middleware before the check's `add_middleware` call.
+  `test_the_token_check_is_the_outermost_middleware` fails otherwise
+- There is one list, `EXEMPT_PATHS`, and it lists exemptions.
+  `tests/test_auth_routes.py::TestRequiredMode` walks `app.routes` and fails
+  if any route other than `/health` answers a tokenless or wrong-token
+  request with anything but 401, so growing the exempt list means changing
+  that test on purpose
+- `EXEMPT_PATHS` is compared with `scope["path"]` exactly. Keep it exact: a
+  suffix match would also exempt a real route whose last path parameter is
+  spelled `health` (`DELETE /calendars/health/events/health`), which
+  `test_a_path_parameter_spelled_health_does_not_open_a_route` checks; a
+  prefix match would exempt every path under `/health/`, which
+  `test_a_path_or_method_the_app_does_not_have_is_refused_too` checks. The
+  cost of exact matching: behind `uvicorn --root-path` the path includes the
+  prefix, so `/health` needs a token there (it fails closed; the Dockerfile
+  uses no root path). `test_under_a_root_path_health_needs_the_token` pins
+  that
+- Settings (`CALENDAR_AGENT_API_KEYS`, `CALENDAR_AGENT_AUTH`) are read in the
+  start-up hook (`lifespan` -> `settings_at_startup`), not at import, and an
+  unusable set raises `AuthConfigError` there so the server exits. Tests get
+  theirs from the autouse `auth_settings` fixture in `tests/conftest.py`
+  (`required`, one synthetic token) and the `client` fixtures send that
+  token; a test of another mode assigns `app.state.auth_settings` (see
+  `use_settings` in `tests/test_auth_routes.py`)
+- A refusal is 401 with `WWW-Authenticate: Bearer` and
+  `{"success": false, "error": "Missing or invalid bearer token"}`: the same
+  body for a missing and a wrong token, and no `outcome` (nothing was
+  attempted)
+- Do not put a token, configured or presented, in a log line, an error
+  message or a response. Settings errors name an entry by position and
+  repeat nothing from the value (a token can be pasted into the name slot).
+  `TestNoTokenTextAnywhere` and `TestMalformedApiKeys` pin this
+- Log the route template (`route_template`), not `scope["path"]`: the path
+  holds calendar and event ids and is caller-controlled text
+- A script that calls this service reads its token from
+  `CALENDAR_AGENT_API_KEY` and hands it to `curl` on stdin (`-H @-`), as
+  `scripts/calendar-delete-event.sh` does
+- The OpenAPI document gets the scheme from `declare_bearer_scheme`, because
+  FastAPI does not document a middleware
+- The app has only plain HTTP routes. The middleware also refuses a
+  WebSocket handshake without a token (close code 1008; the exempt paths
+  apply to HTTP only), and the route walk fails on any route that is not a
+  plain HTTP route until it is taught how to call it
 
 ### Modifying LLM Behavior
 

@@ -266,3 +266,109 @@ def test_readme_lists_every_stripped_read_only_event_field(subtests):
             assert f"`{field}`" in readme_content, (
                 f"README.md does not list stripped read-only field `{field}`"
             )
+
+
+# ----------------------------------------------------------------------------
+# Authentication (issue #15)
+# ----------------------------------------------------------------------------
+
+ENV_EXAMPLE_PATH = Path(__file__).parent.parent / ".env.example"
+AUTH_HEADER_IN_EXAMPLES = '-H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"'
+
+
+def _readme_curl_commands() -> list[str]:
+    """Each ``curl`` command in the README, continuation lines joined."""
+    commands, current = [], None
+    for line in README_PATH.read_text().splitlines():
+        if current is None and line.startswith("curl "):
+            current = line
+        elif current is not None:
+            current += "\n" + line
+        else:
+            continue
+        if not line.rstrip().endswith("\\"):
+            commands.append(current)
+            current = None
+    return commands
+
+
+def test_readme_curl_examples_send_the_token_except_to_health(subtests):
+    """Every example request in the README is one a reader can paste against
+    a server in the default ``required`` mode: it carries the Authorization
+    header, read from an environment variable rather than written out. The
+    ``/health`` example shows that route needs none."""
+    commands = _readme_curl_commands()
+    assert len(commands) >= 19, f"found only {len(commands)} curl examples"
+    health = [c for c in commands if re.search(r"localhost:8082/health\b", c)]
+    assert len(health) == 1
+    for command in commands:
+        with subtests.test(command=command.splitlines()[0]):
+            if command in health:
+                assert "Authorization" not in command
+            else:
+                assert AUTH_HEADER_IN_EXAMPLES in command
+
+
+def test_readme_documents_the_authentication_settings(subtests):
+    readme = README_PATH.read_text()
+    assert "### Authentication" in readme
+    section = _section(readme, "### Authentication", "### Running the Server")
+    for needle in (
+        "CALENDAR_AGENT_API_KEYS",
+        "CALENDAR_AGENT_AUTH",
+        "`required`",
+        "`optional`",
+        "`off`",
+        "Authorization: Bearer",
+        "/health",
+        "WWW-Authenticate",
+        "secrets.token_urlsafe",
+        "#### Rolling it out",
+    ):
+        with subtests.test(needle=needle):
+            assert needle in section, f"the Authentication section does not mention {needle}"
+    with subtests.test("configuration table"):
+        table = _section(readme, "Required environment variables:", "#### Coupling with api-proxy")
+        assert "`CALENDAR_AGENT_API_KEYS`" in table
+        assert "`CALENDAR_AGENT_AUTH`" in table
+    with subtests.test("error table"):
+        errors = _section(readme, "### Error Responses", "#### Validation: unknown fields")
+        assert "| `401` |" in errors
+    with subtests.test("delete script"):
+        script = _section(
+            readme,
+            "#### Deleting from a script",
+            "### POST /calendars/{calendar_id}/events/{event_id}/respond",
+        )
+        assert "`CALENDAR_AGENT_API_KEY`" in script
+
+
+def test_readme_states_the_same_minimum_token_length_as_the_code():
+    from calendar_agent.auth import MIN_TOKEN_LENGTH
+
+    section = _section(README_PATH.read_text(), "### Authentication", "### Running the Server")
+    assert f"at least {MIN_TOKEN_LENGTH} characters" in section
+
+
+def test_env_example_names_both_settings_and_cannot_start_a_server_as_is():
+    """Copied to ``.env`` unedited, the example must not produce a running
+    service with a published placeholder as its token: the values it ships
+    are refused at start-up."""
+    from dotenv import dotenv_values
+
+    from calendar_agent.auth import AuthConfigError, load_auth_settings
+
+    text = ENV_EXAMPLE_PATH.read_text()
+    assert "CALENDAR_AGENT_API_KEYS" in text
+    assert "CALENDAR_AGENT_AUTH" in text
+    values = {key: value or "" for key, value in dotenv_values(ENV_EXAMPLE_PATH).items()}
+    assert "CALENDAR_AGENT_API_KEYS" in values, "the example leaves the keys setting commented out"
+    with pytest.raises(AuthConfigError):
+        load_auth_settings(values)
+
+
+def test_claude_md_tells_maintainers_how_the_token_check_works(subtests):
+    claude_md = CLAUDE_MD_PATH.read_text()
+    for needle in ("calendar_agent/auth.py", "EXEMPT_PATHS", "BearerAuthMiddleware", "issue #15"):
+        with subtests.test(needle=needle):
+            assert needle in claude_md

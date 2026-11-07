@@ -69,6 +69,8 @@ Required environment variables:
 | `LLM_URL` | URL of the local LLM server | `http://localhost:8080/v1/chat/completions` |
 | `LLM_MODEL` | Model name for LLM requests | `qwen/qwen3-14b` |
 | `CALENDAR_AGENT_PORT` | Port for the calendar agent server | `8082` |
+| `CALENDAR_AGENT_API_KEYS` | The callers' bearer tokens: comma-separated `name:token` pairs, one per caller (see [Authentication](#authentication)). In `required` mode the server refuses to start without at least one | (none) |
+| `CALENDAR_AGENT_AUTH` | `required`, `optional` or `off` (see [Authentication](#authentication)) | `required` |
 | `PROXY_CONFIRMATION_WINDOW` | How long (seconds) api-proxy waits for a human to approve a mutation — **must mirror the proxy's `--confirmation-timeout` by hand** (see [Coupling with api-proxy](#coupling-with-api-proxy)). Must be finite and positive | `300` |
 | `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them. Must be at least `PROXY_CONFIRMATION_WINDOW` + 30s; the server refuses to start otherwise, and refuses `nan`/`inf` | `330` (window + 30) |
 
@@ -85,6 +87,143 @@ here to match** (and set `PROXY_CONFIRM_TIMEOUT` at least 30s above it, or
 leave it unset to follow automatically). A proxy configured to wait forever
 cannot be mirrored — set a finite window on both sides.
 
+### Authentication
+
+In the default mode, every route except `/health` requires a bearer token
+([issue #15](https://github.com/brianroberg/calendar-agent/issues/15); the
+other two modes are described under [The two settings](#the-two-settings)):
+
+```
+Authorization: Bearer <token>
+```
+
+The check sits in front of the whole application rather than on individual
+routes, and it runs before routing and request validation. The API
+documentation routes (`/docs`, `/redoc`, `/openapi.json`), paths that do not
+exist, and routes added later are therefore covered without being listed
+anywhere. The one list is of exemptions, and `/health` is its only entry.
+The exemption compares the request path exactly as the server reports it.
+Served at the root of its host, as the Dockerfile runs it, `/health` needs no
+token. Behind `uvicorn --root-path /prefix` the server reports the path as
+`/prefix/health`, so there `/health` needs a token like any other route. A
+refused request is answered straight away: it is not validated, and it does
+not reach the proxy or the proxy's operator-approval wait.
+
+A refused request gets `401`, a `WWW-Authenticate: Bearer` header, and the
+usual envelope. The body is the same whether the token was
+missing or wrong:
+
+```json
+{"success": false, "error": "Missing or invalid bearer token"}
+```
+
+The server accepts one `Authorization` header of the form `Bearer <token>`
+(the word `Bearer` in any letter case). A token in the query string or in
+another header is not read.
+
+#### The two settings
+
+`CALENDAR_AGENT_API_KEYS` holds one `name:token` pair per caller, separated by
+commas:
+
+```bash
+CALENDAR_AGENT_API_KEYS=laptop:<token>,scheduler:<token>
+```
+
+Each caller has its own name and token, so one caller's token can be replaced
+without touching the others. The name is what the log shows for that caller;
+the token is not logged. Checked when the server starts:
+
+- a name is 1 to 31 characters of letters, digits, `.`, `_` and `-`, and is
+  not used twice (31 is one less than the shortest token, so a token pasted
+  into the name slot is refused rather than logged as a caller's name);
+- a token is at least 32 characters, made of the characters a Bearer header
+  can carry (letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and `=` at the
+  end), and is not used twice.
+
+A value that breaks one of these stops the server at start-up. The message
+names the entry by its position (`entry 2 has a token shorter than 32
+characters`) and repeats no part of the value.
+
+Mint a token with either of:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+openssl rand -hex 32
+```
+
+`CALENDAR_AGENT_AUTH` chooses the mode:
+
+| Mode | Request with no `Authorization` header | Header that is not a configured token | Start with no tokens configured |
+|------|----------------------------------------|---------------------------------------|---------------------------------|
+| `required` (the default) | `401` | `401` | Refused: the server exits at start-up with a message naming both settings |
+| `optional` | Served, and logged at warning level with the method, the route and the client address | `401` | Allowed (then every request that does send a token gets `401`) |
+| `off` | Served | Served | Allowed; `CALENDAR_AGENT_API_KEYS` is not read at all, and a warning is logged at start-up |
+
+Any other value of `CALENDAR_AGENT_AUTH` stops the server at start-up; it is
+not read as one of the three. Both settings are read when the server starts,
+so a change takes effect at the next restart.
+
+The server keeps a SHA-256 digest of each token rather than the token, and
+compares a presented token against every configured one with
+`hmac.compare_digest`.
+
+#### What is logged
+
+The logger is `calendar_agent.auth`. One line at start-up says which mode is
+in force and which caller names are configured. After that, in `required`
+and `optional` mode, each request to a route other than `/health` produces
+one line:
+
+```
+authenticated request: caller=laptop method=GET route=/calendars/{calendar_id}/events
+unauthenticated request served (CALENDAR_AGENT_AUTH=optional): method=GET route=/calendars client=127.0.0.1
+refused request: method=DELETE route=/calendars/{calendar_id}/events/{event_id} client=127.0.0.1 reason=token not recognised
+```
+
+The first is at info level, the other two at warning level. `route` is the
+route's template, not the request path, so calendar and event ids are not
+copied into the log; a path that matches no route is shown as
+`(no matching route)`. If neither the root logger nor the `calendar_agent`
+logger has a handler at start-up, as when the server is started with plain
+`uvicorn`, these lines go to stderr at info level. uvicorn's own
+`--log-level` sets uvicorn's loggers and does not quiet them. To quiet
+them, give the root or the `calendar_agent` logger a handler (for example
+with uvicorn's `--log-config`) and set the level there. (Those two cases
+were checked by hand against a running server; the tests cover the
+no-handler case and the already-configured case.) (uvicorn's own access log is separate from
+these lines, and it does print the request path with its query string, so a
+token a caller puts in the query string is written there even though it is
+not accepted.)
+
+#### Rolling it out
+
+`required` is the default. **A server upgraded to this version and started
+with neither setting exits at start-up**, so set both before upgrading:
+
+1. Mint one token per caller. Set `CALENDAR_AGENT_API_KEYS`, set
+   `CALENDAR_AGENT_AUTH=optional`, and restart. Requests without a token are
+   still served; a wrong token is already refused.
+2. Give each caller its token. Every caller needs one: scripts (the delete
+   wrapper reads `CALENDAR_AGENT_API_KEY`, and so must any copy of it kept
+   elsewhere), skills, and anything else that calls this server.
+3. Watch the log for `unauthenticated request served` lines. Each one names a
+   route that some caller still uses without a token.
+4. When there are none left, set `CALENDAR_AGENT_AUTH=required` (or remove
+   the setting) and restart.
+5. Check that `required` is in force. Request a route other than `/health`
+   with no `Authorization` header, for example with
+   `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/calendars`,
+   and expect `401`. Any other HTTP status means the request got past the
+   token check, so the server is not in `required` mode. Do not test with a wrong
+   token instead: `optional` answers that with `401` too, so it cannot tell
+   the two modes apart. The start-up log line also names the mode.
+
+To undo, set `CALENDAR_AGENT_AUTH=off` and restart. A container health check
+should request `/health`, which needs no token in any mode when the server is
+served at the root of its host, as the Dockerfile runs it (not behind
+`--root-path`; see above).
+
 ### Running the Server
 
 ```bash
@@ -95,7 +234,9 @@ uv run python -m calendar_agent.calendar_server
 uv run uvicorn calendar_agent.calendar_server:app --host 0.0.0.0 --port 8082
 ```
 
-The server will be available at `http://localhost:8082`. API documentation is at `http://localhost:8082/docs`.
+The server will be available at `http://localhost:8082`. API documentation is at `http://localhost:8082/docs`; the documentation routes need the token like any other route (see [Authentication](#authentication)), and a browser does not send one, so fetch `/openapi.json` with the header instead. The OpenAPI document declares the bearer scheme.
+
+The request examples below read the token from the shell variable `CALENDAR_AGENT_API_KEY`. They are for interactive use: the ones that send the token put it on `curl`'s command line, which other processes on the machine can read. A script should pass the header on standard input instead, as `scripts/calendar-delete-event.sh` does: `printf 'Authorization: Bearer %s\n' "$CALENDAR_AGENT_API_KEY" | curl -H @- …`.
 
 ## API Endpoints
 
@@ -109,6 +250,7 @@ Every endpoint returns a body with a `success` field, and on failure an
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
 | `400` | The proxy rejected the request as malformed or not applicable, and its message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event); also this service's own refusal to RSVP through a calendar that is not the authenticated user's own, which is not forwarded to the proxy at all |
+| `401` | The request did not carry a valid bearer token (see [Authentication](#authentication)). The check comes before routing and validation, so nothing was validated or sent upstream. The response has a `WWW-Authenticate: Bearer` header and the plain `success: false` / `error` envelope, with no `outcome` |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
 | `422` | Request validation failed: an unknown field or query key, a missing required field, or a bad value — nothing was sent upstream. Same `success: false` / `error` envelope as every other failure, plus FastAPI's `detail` list (see below). A `PUT`/`PATCH` body that would forward nothing (`{}`, all-null values, or only read-only keys) is rejected this way too, and a bulk `update`/`patch` with a missing or empty `updates` payload rejects the **whole batch**, before any operation runs |
@@ -121,7 +263,7 @@ also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
 "may still apply". The exception is a request-validation `422` (for example
 `DELETE …?sendUpdates=all`, an undeclared query key): it carries the
 validation envelope described below and no `outcome`, since nothing was
-attempted.
+attempted. A `401` carries no `outcome` for the same reason.
 | `500` | Unexpected internal error |
 
 #### Validation: unknown fields are rejected, not ignored
@@ -200,7 +342,10 @@ the query string is fixed and the request is resent.
 
 ### GET /health
 
-Health check endpoint. Returns server status and version.
+Health check endpoint. Returns server status and version. It is the one route
+that needs no token, in every mode, when the server is served at the root of
+its host as the Dockerfile runs it (behind `uvicorn --root-path` it needs one;
+see [Authentication](#authentication)).
 
 ```bash
 curl http://localhost:8082/health
@@ -223,7 +368,8 @@ Response:
 List all calendars for the authenticated user.
 
 ```bash
-curl http://localhost:8082/calendars
+curl http://localhost:8082/calendars \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"
 ```
 
 Response:
@@ -248,7 +394,8 @@ Response:
 Get metadata for a specific calendar.
 
 ```bash
-curl http://localhost:8082/calendars/primary
+curl http://localhost:8082/calendars/primary \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"
 ```
 
 Response:
@@ -281,7 +428,8 @@ Query parameters:
 - `order_by` (string): "startTime" or "updated"
 
 ```bash
-curl "http://localhost:8082/calendars/primary/events?time_min=2024-01-01T00:00:00Z&max_results=10"
+curl "http://localhost:8082/calendars/primary/events?time_min=2024-01-01T00:00:00Z&max_results=10" \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"
 ```
 
 Response:
@@ -402,6 +550,7 @@ Query parameter: `send_updates` (`all`, `externalOnly`, `none`).
 
 ```bash
 curl -X POST http://localhost:8082/calendars/primary/events \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "summary": "Project Review",
@@ -434,7 +583,8 @@ Response:
 Get a specific event by ID.
 
 ```bash
-curl http://localhost:8082/calendars/primary/events/event123
+curl http://localhost:8082/calendars/primary/events/event123 \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"
 ```
 
 Response:
@@ -469,6 +619,7 @@ events are the common case) -- Google's read-only keys (`id`, `etag`,
 
 ```bash
 curl -X PUT http://localhost:8082/calendars/primary/events/event123 \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "summary": "Updated Meeting Title",
@@ -498,6 +649,7 @@ fields sent are changed. A body that would forward nothing is a `422`, as on
 
 ```bash
 curl -X PATCH http://localhost:8082/calendars/primary/events/event123 \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"location": "New Conference Room"}'
 ```
@@ -532,7 +684,8 @@ event afterwards and decides from that:
 | `404` no such event | *(not re-read — nothing to delete)* | `404` | `failed` |
 
 ```bash
-curl -X DELETE http://localhost:8082/calendars/primary/events/event123
+curl -X DELETE http://localhost:8082/calendars/primary/events/event123 \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY"
 ```
 
 Response:
@@ -581,10 +734,11 @@ reports through its exit status:
 | `1` | `FAILURE` | The event is still there and nothing is outstanding (rejected `403`, other `4xx`, or `success: false`) |
 | `2` | `UNKNOWN` | The event is still there but the deletion may yet be applied (the DELETE timed out, or answered `408`/**any `5xx`** — a `502` can be a transport fault *after* the request reached the proxy, where it stays queued), or the re-read established nothing, or the response carried no calendar-agent envelope (a bare router `404` from a wrong `CALENDAR_AGENT_URL`) |
 | `3` | `NOT FOUND` | The DELETE itself answered `404`/`410` *with* calendar-agent's envelope — the event id (or calendar id) didn't exist before this ran, so nothing was deleted. Check the id; a re-read that also 404s is not evidence of a completed deletion |
-| `4` | `USAGE` | Bad arguments or configuration (missing url, `python3` not on `PATH`, a deadline that does not outlive the server's budget). Nothing was attempted |
+| `4` | `USAGE` | Bad arguments or configuration (missing url, `python3` not on `PATH`, a deadline that does not outlive the server's budget, or calendar-agent refusing the bearer token with its `401`). Nothing was attempted |
 
 ```bash
 CALENDAR_AGENT_URL=http://localhost:8082 \
+CALENDAR_AGENT_API_KEY="$CALENDAR_AGENT_API_KEY" \
   scripts/calendar-delete-event.sh event123 primary
 ```
 
@@ -596,6 +750,7 @@ RESULT: SUCCESS - event no longer present
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
+| `CALENDAR_AGENT_API_KEY` | This caller's bearer token (see [Authentication](#authentication)), sent as `Authorization: Bearer <token>` on the DELETE and on the verifying GET. The script hands it to `curl` on standard input (`-H @-`, curl 7.55 or later) rather than on the command line, and does not print it (tracing with `bash -x` does, as it prints each command as expanded). When unset, no `Authorization` header is sent; against a server in `required` mode that is a `401` and exit `4` | (unset) |
 | `CALENDAR_AGENT_CONFIRM_TIMEOUT` | calendar-agent's own mutation budget (its `PROXY_CONFIRM_TIMEOUT`); the script cannot read it across the container boundary, so keep them in step by hand | `330` |
 | `CALENDAR_DELETE_MAX_TIME` | `curl` deadline for the DELETE. **Must exceed the budget** — the script refuses (exit `4`) otherwise, because a shorter deadline abandons the DELETE while the operator can still approve it, re-creating one hop out the very mismatch the server guards against | budget + 10 = `340` |
 | `CALENDAR_DELETE_VERIFY_MAX_TIME` | `curl` deadline for the verifying GET (an ordinary 30s-bounded read) | `35` |
@@ -658,6 +813,7 @@ Request body:
 
 ```bash
 curl -X POST http://localhost:8082/calendars/primary/events/event123/respond \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"response_status": "accepted"}'
 ```
@@ -704,6 +860,7 @@ Summarize a calendar event using AI.
 
 ```bash
 curl -X POST http://localhost:8082/summarize \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -730,6 +887,7 @@ Ask a question about a specific calendar event.
 
 ```bash
 curl -X POST http://localhost:8082/ask-about \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -757,6 +915,7 @@ Summarize multiple events, optionally with triage classification.
 
 ```bash
 curl -X POST http://localhost:8082/batch-summarize \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -796,6 +955,7 @@ Find available time slots and get AI suggestions for scheduling.
 
 ```bash
 curl -X POST http://localhost:8082/find-free-time \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -837,6 +997,7 @@ Analyze schedule patterns and get AI-powered insights.
 
 ```bash
 curl -X POST http://localhost:8082/analyze-schedule \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -869,6 +1030,7 @@ Generate an AI-powered schedule briefing.
 
 ```bash
 curl -X POST http://localhost:8082/prepare-briefing \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -919,6 +1081,7 @@ flat shape:
 
 ```bash
 curl -X POST http://localhost:8082/search \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -933,6 +1096,7 @@ curl -X POST http://localhost:8082/search \
 
 # Equivalent flat shape
 curl -X POST http://localhost:8082/search \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "calendar_id": "primary",
@@ -1009,6 +1173,7 @@ that can still change the calendar), else `403` if any was rejected, else
 
 ```bash
 curl -X POST http://localhost:8082/bulk-actions \
+  -H "Authorization: Bearer $CALENDAR_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "operations": [
@@ -1112,12 +1277,17 @@ calendar-agent/
 ├── calendar_agent/
 │   ├── __init__.py
 │   ├── calendar_server.py    # FastAPI application with all endpoints
+│   ├── auth.py               # Bearer-token settings and the check in front of the app
 │   ├── proxy_client.py       # HTTP client for api-proxy
 │   ├── calendar_utils.py     # Utility functions
 │   ├── llm_service.py        # LLM provider abstraction and implementation
 │   └── exceptions.py         # Custom exceptions
 ├── tests/
 │   ├── conftest.py           # Test fixtures
+│   ├── test_auth_config.py   # Token and mode settings: parsing and refusals
+│   ├── test_auth_middleware.py   # The check around a stand-in app (WebSocket, other types)
+│   ├── test_auth_routes.py   # The check on the real app: route walk, modes, logging
+│   ├── test_auth_startup.py  # Start-up hook, and the real server on a loopback port
 │   ├── test_calendar_server.py
 │   ├── test_delete_event_script.py  # End-to-end tests for the delete wrapper
 │   ├── test_proxy_contract.py    # Client routes vs. the api-proxy spec snapshot

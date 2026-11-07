@@ -10,9 +10,36 @@ from fastapi.testclient import TestClient
 
 from tests.factories import SAMPLE_CALENDARS, SAMPLE_EVENTS
 
+# A synthetic token for the suite. The app under test runs in `required` mode
+# with this one token configured (issue #15), and the `client` fixtures send
+# it, so every existing test exercises its route as an authenticated caller.
+TEST_API_TOKEN = "synthetic-test-suite-token-0123456789abcdef"
+TEST_AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
+
+
 # ============================================================================
 # Mock Fixtures
 # ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def auth_settings():
+    """Give the app its authentication settings for the test, then take them
+    away again.
+
+    The server reads them from the environment in its start-up hook, which a
+    bare ``TestClient(app)`` does not run. Tests of the other modes assign
+    ``app.state.auth_settings`` themselves; this fixture restores the state
+    afterwards either way.
+    """
+    from calendar_agent import auth
+    from calendar_agent.calendar_server import app
+
+    app.state.auth_settings = auth.load_auth_settings(
+        {auth.KEYS_ENV: f"test-suite:{TEST_API_TOKEN}"}
+    )
+    yield
+    del app.state.auth_settings
 
 
 @pytest.fixture(autouse=True)
@@ -106,16 +133,17 @@ def mock_llm_service():
 
 @pytest.fixture
 def client(mock_proxy_client, mock_llm_service):
-    """FastAPI test client with mocked dependencies."""
+    """FastAPI test client with mocked dependencies, sending the suite's token."""
     from calendar_agent.calendar_server import app
-    return TestClient(app)
+    return TestClient(app, headers=TEST_AUTH_HEADERS)
 
 
 @pytest.fixture
 def client_no_mocks():
-    """FastAPI test client without mocked dependencies (for integration tests)."""
+    """FastAPI test client without mocked dependencies (for integration tests),
+    sending the suite's token."""
     from calendar_agent.calendar_server import app
-    return TestClient(app)
+    return TestClient(app, headers=TEST_AUTH_HEADERS)
 
 
 # ============================================================================
